@@ -12,8 +12,6 @@ from urllib.parse import parse_qs, urlparse
 from common import discover_wechat_pids, read_maps, region_wanted, role_from_cmdline
 
 
-DIRECT_OBJECT_ANCHOR = '{"AppMsgId":'
-ESCAPED_OBJECT_ANCHOR = r'{\"AppMsgId\":'
 MMREADER_ANCHOR = '<category type="20" count="'
 COUNT_RE = re.compile(r'<category type="20" count="(?P<count>\d+)">')
 PUBLISHER_RE = re.compile(
@@ -28,9 +26,6 @@ CDATA_FIELD_TEMPLATES = {
     "digest": re.compile(r"<digest><!\[CDATA\[(.*?)\]\]></digest>", re.S),
 }
 PUB_TIME_RE = re.compile(r"<pub_time>(.*?)</pub_time>")
-FIELD_RE = re.compile(
-    r'"(?P<key>AppMsgId|DateTime|ContentUrl|Digest|Title|sourceUsername|showName|name|totalCnt|ItemIndex|pub_time)"\s*:\s*(?:"(?P<str>(?:\\.|[^"\\])*)"|(?P<num>-?\d+))'
-)
 
 
 @dataclass
@@ -54,13 +49,6 @@ class ItemXml:
     source: str
 
 
-def decode_json_string(value: str) -> str:
-    try:
-        return json.loads(f'"{value}"')
-    except json.JSONDecodeError:
-        return value.replace(r"\/", "/")
-
-
 def clean_text(value: str) -> str:
     value = html.unescape(value).replace("\x00", "")
     return " ".join(value.split())
@@ -79,31 +67,6 @@ def parse_link(url: str) -> tuple[str, str, str]:
     return query.get("mid", [""])[0], query.get("idx", [""])[0], query.get("__biz", [""])[0]
 
 
-def object_end(text: str, start: int) -> int:
-    depth = 0
-    in_string = False
-    escaped = False
-    for pos in range(start, len(text)):
-        char = text[pos]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return pos + 1
-    return -1
-
-
 def xml_block_end(text: str, start: int) -> int:
     mmreader_end = text.find("</mmreader>", start)
     if mmreader_end < 0:
@@ -111,20 +74,17 @@ def xml_block_end(text: str, start: int) -> int:
     return mmreader_end + len("</mmreader>")
 
 
+def xml_block_end_bytes(data: bytes, start: int) -> int:
+    end_tag = b"</mmreader>"
+    mmreader_end = data.find(end_tag, start)
+    if mmreader_end < 0:
+        return -1
+    return mmreader_end + len(end_tag)
+
+
 def extract_xml_cdata(pattern: re.Pattern[str], text: str) -> str:
     match = pattern.search(text)
     return clean_text(match.group(1)) if match else ""
-
-
-def load_direct_objects(text: str) -> list[tuple[int, str]]:
-    objects: list[tuple[int, str]] = []
-    pos = text.find(DIRECT_OBJECT_ANCHOR)
-    while pos >= 0:
-        end = object_end(text, pos)
-        if end > pos:
-            objects.append((pos, text[pos:end]))
-        pos = text.find(DIRECT_OBJECT_ANCHOR, pos + 1)
-    return objects
 
 
 def load_mmreader_blocks(text: str) -> list[tuple[int, str]]:
@@ -138,92 +98,34 @@ def load_mmreader_blocks(text: str) -> list[tuple[int, str]]:
     return blocks
 
 
-def load_escaped_objects(text: str) -> list[tuple[int, str]]:
-    objects: list[tuple[int, str]] = []
-    pos = text.find(ESCAPED_OBJECT_ANCHOR)
+def load_mmreader_blocks_bytes(data: bytes) -> list[tuple[int, bytes]]:
+    blocks: list[tuple[int, bytes]] = []
+    anchor = MMREADER_ANCHOR.encode()
+    pos = data.find(anchor)
     while pos >= 0:
-        end = text.find(r'","reportInfo"', pos)
-        if end < 0:
-            end = min(len(text), pos + 24000)
-        escaped = text[pos:end]
-        try:
-            decoded = json.loads(f'"{escaped}"')
-        except json.JSONDecodeError:
-            decoded = escaped.replace(r"\"", '"').replace(r"\/", "/")
-        objects.append((pos, decoded))
-        pos = text.find(ESCAPED_OBJECT_ANCHOR, pos + 1)
-    return objects
+        end = xml_block_end_bytes(data, pos)
+        if end > pos:
+            blocks.append((pos, data[pos:end]))
+        pos = data.find(anchor, pos + 1)
+    return blocks
 
 
-def fields_from_segment(segment: str) -> dict[str, str]:
-    fields: dict[str, str] = {}
-    for match in FIELD_RE.finditer(segment):
-        raw = match.group("str")
-        value = decode_json_string(raw) if raw is not None else match.group("num") or ""
-        fields.setdefault(match.group("key"), value)
-    return fields
-
-
-def row_from_fields(pid: int, role: str, addr: int, encoding: str, source: str, fields: dict[str, str]) -> ItemXml | None:
-    url = clean_url(fields.get("ContentUrl", ""))
-    mid, idx, biz = parse_link(url) if url else ("", "", "")
-    title = clean_text(fields.get("Title", ""))
-    if not (title and mid):
+def title_addr_in_body(body: str, body_bytes: bytes) -> int | None:
+    title = extract_xml_cdata(CDATA_FIELD_TEMPLATES["title"], body)
+    if not title:
         return None
-    return ItemXml(
-        pid=pid,
-        role=role,
-        addr=hex(addr),
-        encoding=encoding,
-        title=title,
-        url=url,
-        source_name=clean_text(fields.get("name", "") or fields.get("showName", "")),
-        summary="",
-        digest=clean_text(fields.get("Digest", "")),
-        pub_time=fields.get("pub_time", "") or fields.get("DateTime", ""),
-        mid=mid,
-        idx=idx or fields.get("ItemIndex", "") or "1",
-        biz=biz,
-        source_username=fields.get("sourceUsername", ""),
-        total_count=int(fields.get("totalCnt") or 0),
-        show_name=clean_text(fields.get("showName", "")),
-        source=source,
-    )
+    prefix = b"<title><![CDATA["
+    title_bytes = title.encode()
+    pos = body_bytes.find(prefix + title_bytes)
+    if pos < 0:
+        return None
+    return pos + len(prefix)
 
 
-def scan_text(pid: int, role: str, base: int, encoding: str, text: str) -> list[ItemXml]:
+def scan_mmreader_text(pid: int, role: str, base: int, data: bytes) -> list[ItemXml]:
     rows: list[ItemXml] = []
-    for source, loader in (("direct-detail", load_direct_objects), ("escaped-detail", load_escaped_objects)):
-        for offset, segment in loader(text):
-            try:
-                item = json.loads(segment)
-            except json.JSONDecodeError:
-                item = None
-            if isinstance(item, dict):
-                detail = item.get("detailInfo") or item.get("DetailInfo") or {}
-                fields = {
-                    "AppMsgId": str(item.get("AppMsgId") or ""),
-                    "DateTime": str(item.get("DateTime") or ""),
-                    "sourceUsername": str(item.get("sourceUsername") or ""),
-                    "showName": str(item.get("showName") or ""),
-                    "name": str(item.get("name") or ""),
-                    "totalCnt": str(item.get("totalCnt") or ""),
-                    "ContentUrl": str(detail.get("ContentUrl") or item.get("ContentUrl") or ""),
-                    "Digest": str(detail.get("Digest") or item.get("Digest") or ""),
-                    "Title": str(detail.get("Title") or item.get("Title") or ""),
-                    "ItemIndex": str(detail.get("ItemIndex") or item.get("ItemIndex") or ""),
-                }
-            else:
-                fields = fields_from_segment(segment)
-            row = row_from_fields(pid, role, base + offset * (2 if encoding == "utf-16le" else 1), encoding, source, fields)
-            if row:
-                rows.append(row)
-    return rows
-
-
-def scan_mmreader_text(pid: int, role: str, base: int, encoding: str, text: str) -> list[ItemXml]:
-    rows: list[ItemXml] = []
-    for offset, block in load_mmreader_blocks(text):
+    for offset, block_bytes in load_mmreader_blocks_bytes(data):
+        block = block_bytes.decode("utf-8", errors="ignore")
         count_match = COUNT_RE.search(block)
         publisher_match = PUBLISHER_RE.search(block)
         if not count_match or not publisher_match:
@@ -231,8 +133,13 @@ def scan_mmreader_text(pid: int, role: str, base: int, encoding: str, text: str)
         total_count = int(count_match.group("count"))
         source_username = clean_text(publisher_match.group("username"))
         show_name = clean_text(publisher_match.group("nickname"))
+        search_from = 0
         for index, match in enumerate(ITEM_RE.finditer(block), start=1):
             body = match.group("body")
+            body_bytes = body.encode()
+            body_pos = block_bytes.find(body_bytes, search_from)
+            if body_pos < 0:
+                body_pos = block_bytes.find(body_bytes)
             url = clean_url(extract_xml_cdata(CDATA_FIELD_TEMPLATES["url"], body))
             mid, idx, biz = parse_link(url) if url else ("", "", "")
             title = extract_xml_cdata(CDATA_FIELD_TEMPLATES["title"], body)
@@ -242,12 +149,26 @@ def scan_mmreader_text(pid: int, role: str, base: int, encoding: str, text: str)
             digest = extract_xml_cdata(CDATA_FIELD_TEMPLATES["digest"], body)
             pub_time_match = PUB_TIME_RE.search(body)
             pub_time = clean_text(pub_time_match.group(1)) if pub_time_match else ""
+            title_rel = title_addr_in_body(body, body_bytes)
+            title_bytes = title.encode()
+            if body_pos >= 0:
+                search_from = body_pos + len(body_bytes)
+            if body_pos >= 0 and title_rel is not None:
+                addr = hex(base + offset + body_pos + title_rel)
+            elif body_pos >= 0:
+                title_pos = block_bytes.find(title_bytes, body_pos)
+                addr = hex(base + offset + (title_pos if title_pos >= 0 else body_pos))
+            else:
+                title_pos = block_bytes.find(title_bytes, search_from)
+                if title_pos < 0:
+                    title_pos = block_bytes.find(title_bytes)
+                addr = hex(base + offset + (title_pos if title_pos >= 0 else 0))
             rows.append(
                 ItemXml(
                     pid=pid,
                     role=role,
-                    addr=hex(base + (offset + match.start()) * (2 if encoding == "utf-16le" else 1)),
-                    encoding=encoding,
+                    addr=addr,
+                    encoding="utf-8",
                     title=title,
                     url=url,
                     source_name=show_name or source_username,
@@ -264,6 +185,12 @@ def scan_mmreader_text(pid: int, role: str, base: int, encoding: str, text: str)
                 )
             )
     return rows
+
+
+def scan_memory_block(pid: int, role: str, base: int, block: bytes) -> list[ItemXml]:
+    if MMREADER_ANCHOR.encode() not in block:
+        return []
+    return scan_mmreader_text(pid, role, base, block)
 
 
 
@@ -290,16 +217,7 @@ def scan_pid(pid: int, all_regions: bool) -> list[ItemXml]:
                     continue
                 block = carry + data
                 base = pos - len(carry)
-                if b'AppMsgId' in block and b'ContentUrl' in block:
-                    text = block.decode("utf-8", errors="ignore")
-                    rows.extend(scan_text(pid, role, base, "utf-8", text))
-                    rows.extend(scan_mmreader_text(pid, role, base, "utf-8", text))
-                elif MMREADER_ANCHOR.encode() in block:
-                    text = block.decode("utf-8", errors="ignore")
-                    rows.extend(scan_mmreader_text(pid, role, base, "utf-8", text))
-                if "AppMsgId".encode("utf-16le") in block and "ContentUrl".encode("utf-16le") in block:
-                    text = block.decode("utf-16le", errors="ignore")
-                    rows.extend(scan_text(pid, role, base, "utf-16le", text))
+                rows.extend(scan_memory_block(pid, role, base, block))
                 carry = block[-overlap:]
                 pos += size
     return rows
@@ -313,8 +231,8 @@ def dedupe(rows: list[ItemXml]) -> list[ItemXml]:
         if old is None:
             best[key] = row
             continue
-        old_score = (bool(old.show_name), bool(old.source_username), old.total_count, old.encoding == "utf-16le")
-        new_score = (bool(row.show_name), bool(row.source_username), row.total_count, row.encoding == "utf-16le")
+        old_score = (bool(old.show_name), bool(old.source_username), old.total_count)
+        new_score = (bool(row.show_name), bool(row.source_username), row.total_count)
         if new_score > old_score:
             best[key] = row
 
@@ -322,15 +240,14 @@ def dedupe(rows: list[ItemXml]) -> list[ItemXml]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="扫描微信内存里的公众号文章，默认导出所有能找到的文章")
+    parser = argparse.ArgumentParser(description="扫描微信主进程内存里的公众号文章，默认导出所有能找到的 XML 文章")
     parser.add_argument("pids", nargs="*", type=int)
     parser.add_argument("--all-regions", action="store_true")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
-    pids = args.pids or discover_wechat_pids()
-
     rows: list[ItemXml] = []
+    pids = args.pids or [pid for pid in discover_wechat_pids() if role_from_cmdline(pid) == "wechat-main"]
     for pid in pids:
         if Path(f"/proc/{pid}/mem").exists():
             current = scan_pid(pid, args.all_regions)
@@ -343,7 +260,7 @@ def main() -> None:
     out.write_text(json.dumps([asdict(row) for row in result], ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"out={out}")
     print(f"item_xml={len(result)}")
-    for row in result[:50]:
+    for row in result:
         print(
             f"pid={row.pid} mid={row.mid} idx={row.idx} total={row.total_count} "
             f"source={row.show_name or row.source_name or row.source_username} title={row.title}"
