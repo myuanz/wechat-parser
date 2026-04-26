@@ -11,3 +11,4 @@ wheels/
 dumps
 test
 .codex
+wechat_articles.db*
