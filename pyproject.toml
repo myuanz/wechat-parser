@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "dclassql>=0.3.0",
+    "matplotlib>=3.10.9",
+    "opencv-python>=4.13.0.92",
+]
 
 [dependency-groups]
 dev = [
