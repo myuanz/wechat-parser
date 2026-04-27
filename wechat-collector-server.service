@@ -1,0 +1,13 @@
+[Unit]
+Description=wechat-parser collector server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/wechat-parser
+ExecStart=/root/.local/bin/uv run python server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

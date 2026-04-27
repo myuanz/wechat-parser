@@ -1,0 +1,124 @@
+# wechat-parser JSON API
+
+Base URL: https://wechat.mkyr.fun
+
+## GET /api/accounts
+
+返回所有已采集公众号列表。
+
+请求参数: 无
+
+响应: application/json
+```json
+[
+  {
+    "id": 1,
+    "name": "看懂龙头股",
+    "username": "gh_84e20caee740",
+    "biz": "MzAwNjY4MjQwMA==",
+    "updated_at": "2026-04-27T03:07:27.178135"
+  }
+]
+```
+
+字段说明:
+- id: 内部 ID，用于 /api/articles 的 account_id 过滤
+- biz: 微信公众号 base64 标识
+- username: gh_* 格式的微信号
+
+## GET /api/articles
+
+获取文章列表。默认每页 50 条，按抓取时间倒序。
+
+请求参数（均为可选）:
+- account_id: int          — 按公众号 ID 过滤
+- pub_time_from: str       — 发布时间起始（ISO 格式，如 "2026-04-01" 或 "2026-04-01T00:00:00"）
+- pub_time_to: str         — 发布时间截止
+- limit: int (默认 50)      — 每页条数，无上限
+- offset: int (默认 0)      — 分页偏移
+- format: str (默认 "html") — "html" 返回原始 HTML，设为 "markdown" 返回 Markdown 文本
+
+示例:
+```
+GET /api/articles?account_id=1&pub_time_from=2026-04-01&limit=20&offset=0&format=markdown
+```
+
+响应: application/json
+```json
+{
+  "items": [
+    {
+      "id": 19,
+      "key": "MzAwNjY4MjQwMA==:2650559430:1",
+      "account_id": 1,
+      "biz": "MzAwNjY4MjQwMA==",
+      "mid": "2650559430",
+      "idx": "1",
+      "title": "放量了",
+      "url": "http://mp.weixin.qq.com/s?__biz=...",
+      "digest": "",
+      "summary": "【重要提示】...",
+      "pub_time": "2026-04-23T09:03:52",
+      "first_seen_at": "2026-04-26T15:09:53.853017",
+      "last_seen_at": "2026-04-27T03:07:27.178135",
+      "content_fetched_at": "2026-04-27T04:23:01.985732",
+      "seen_count": 145,
+      "content": "<!DOCTYPE html>...或 # 标题..."
+    }
+  ],
+  "total": 23,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+字段说明:
+- content: 根据 format 参数返回 HTML 或 Markdown。文章若尚未抓取则为 null
+- key: "biz:mid:idx" 组合，唯一标识一篇文章
+- pub_time: 文章发布时间（UTC），可能为 null
+- first_seen_at: 本采集器首次发现该文章的时间（UTC）
+- content_fetched_at: 正文抓取完成时间（UTC），null 表示尚未抓取
+- seen_count: 在微信内存中出现的次数（含去重）
+- total: 符合过滤条件的文章总数，用于分页
+
+## GET /api/stats
+
+返回采集概况统计。
+
+请求参数: 无
+
+响应: application/json
+```json
+{
+  "total_accounts": 5,
+  "total_articles": 23,
+  "fetched_articles": 23,
+  "latest_article_at": "2026-04-26T16:00:03.684268"
+}
+```
+
+字段说明:
+- fetched_articles: 已成功抓取正文的文章数
+- latest_article_at: 最新文章的首次发现时间
+
+## 分页策略
+
+调用方通过 limit/offset 翻页。响应中的 total 字段已按 account_id、pub_time_from/to 等过滤条件正确计数。
+
+示例: 获取某公众号的全部文章
+```python
+import requests
+
+account_id = 1
+articles = []
+offset = 0
+while True:
+    resp = requests.get(
+        "http://wechat.mkyr.fun/api/articles",
+        params={"account_id": account_id, "limit": 50, "offset": offset}
+    ).json()
+    articles.extend(resp["items"])
+    if offset + len(resp["items"]) >= resp["total"]:
+        break
+    offset += len(resp["items"])
+```

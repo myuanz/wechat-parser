@@ -1,0 +1,13 @@
+[Unit]
+Description=wechat-parser article auto collector
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/wechat-parser
+ExecStart=/root/.local/bin/uv run python wechat_article_auto_collect.py --interval 60 --fetch-workers 3
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

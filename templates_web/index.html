@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>公众号文章浏览</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; }
+  #app { display: flex; height: 100vh; }
+  .panel { overflow-y: auto; }
+  .panel-left { width: 220px; flex-shrink: 0; border-right: 1px solid #ddd; background: #fff; }
+  .panel-center { width: 320px; flex-shrink: 0; border-right: 1px solid #ddd; background: #fff; display: flex; flex-direction: column; }
+  .panel-right { flex: 1; background: #fff; }
+
+  .panel-left h3 { padding: 12px 16px; font-size: 14px; color: #666; border-bottom: 1px solid #eee; }
+  .acct-item { padding: 10px 16px; cursor: pointer; border-bottom: 1px solid #f0f0f0; font-size: 14px; transition: background .15s; }
+  .acct-item:hover { background: #f0f5ff; }
+  .acct-item.active { background: #e6f0ff; font-weight: 600; color: #1a6feb; }
+
+  .panel-center h4 { padding: 12px 16px; font-size: 13px; color: #666; border-bottom: 1px solid #eee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
+  #article-scroll { flex: 1; overflow-y: auto; }
+  .art-item { padding: 12px 16px; cursor: pointer; border-bottom: 1px solid #f0f0f0; transition: background .15s; }
+  .art-item:hover { background: #f0f5ff; }
+  .art-item.active { background: #e6f0ff; }
+  .art-times { font-size: 11px; color: #999; margin-bottom: 3px; }
+  .art-times span { margin-right: 12px; }
+  .art-title { font-size: 14px; margin-bottom: 4px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .art-meta { font-size: 12px; color: #999; display: flex; gap: 8px; }
+  .art-meta .badge { color: #fff; font-size: 11px; padding: 1px 6px; border-radius: 3px; }
+  .badge-ok { background: #52c41a; }
+  .badge-no { background: #faad14; }
+
+  #pager { flex-shrink: 0; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 10px; border-top: 1px solid #eee; font-size: 13px; }
+  #pager button { border: 1px solid #ddd; background: #fff; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  #pager button:hover { background: #e6f0ff; border-color: #1a6feb; }
+  #pager button:disabled { color: #ccc; cursor: default; background: #f5f5f5; }
+  #pager span { color: #666; }
+
+  .panel-right { flex: 1; background: #fff; display: flex; flex-direction: column; }
+  .article-url-bar { flex-shrink: 0; padding: 6px 16px; background: #fafafa; border-bottom: 1px solid #eee; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .article-url-bar a { color: #1a6feb; text-decoration: none; }
+  .article-url-bar a:hover { text-decoration: underline; }
+  .article-content-wrap { flex: 1; position: relative; }
+  .article-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #bbb; font-size: 16px; flex-direction: column; gap: 8px; }
+  .article-empty small { font-size: 13px; }
+  .article-empty a { color: #1a6feb; }
+  .article-frame { width: 100%; height: 100%; border: none; }
+
+  .loading { padding: 24px; text-align: center; color: #999; }
+  .acct-badge { font-size: 11px; padding: 1px 6px; border-radius: 3px; background: #eee; color: #666; margin-left: 6px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="panel panel-left">
+    <h3>公众号 <a href="/llm.txt" style="font-size:11px;font-weight:normal;color:#1a6feb;float:right">llm.txt</a></h3>
+    <div id="stats-bar" style="padding:6px 16px;font-size:11px;color:#999;border-bottom:1px solid #eee;line-height:1.6">加载中...</div>
+    <div id="account-list"><div class="loading">加载中...</div></div>
+  </div>
+  <div class="panel panel-center">
+    <h4 id="center-title">文章列表</h4>
+    <div id="article-scroll">
+      <div id="article-list"><div class="loading">请选择公众号</div></div>
+    </div>
+    <div id="pager"></div>
+  </div>
+  <div class="panel panel-right">
+    <div id="article-url-bar" class="article-url-bar" style="display:none"></div>
+    <div class="article-content-wrap">
+      <div id="article-view" class="article-empty">选择文章查看内容</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => document.querySelectorAll(s);
+
+const PAGE_SIZE = 30;
+let accounts = [], loadedArticles = [], selectedAccountId = null, selectedArticleId = null,
+    currentPage = 0, totalArticles = 0;
+
+function h(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function hAttr(s) {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function fmtTime(iso) {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+async function loadAccounts() {
+  const resp = await fetch('/api/accounts');
+  accounts = await resp.json();
+  const el = $('#account-list');
+  el.innerHTML = accounts.map(a => `
+    <div class="acct-item" data-id="${a.id}" onclick="selectAccount(${a.id})">
+      ${h(a.name)}<span class="acct-badge">${h(a.username || a.biz || '')}</span>
+    </div>
+  `).join('');
+}
+
+async function loadStats() {
+  const resp = await fetch('/api/stats');
+  const s = await resp.json();
+  $('#stats-bar').innerHTML = `共 ${s.total_accounts} 个公众号<br>${s.total_articles} 篇文章<br>已抓取 ${s.fetched_articles} 篇<br><span style="font-size:10px">上次采集 ${fmtTime(s.last_collect_at)}</span>`;
+}
+
+async function selectAccount(id) {
+  selectedAccountId = id;
+  selectedArticleId = null;
+  loadedArticles = [];
+  currentPage = 0;
+  $$('.acct-item').forEach(el => el.classList.toggle('active', +el.dataset.id === id));
+  $$('.art-item').forEach(el => el.classList.remove('active'));
+  $('#article-view').innerHTML = '<div class="article-empty">选择文章查看内容</div>';
+  $('#article-url-bar').style.display = 'none';
+  $('#center-title').textContent = accounts.find(a => a.id === id)?.name || '文章列表';
+  await loadPage(0);
+}
+
+async function loadPage(page) {
+  currentPage = page;
+  const el = $('#article-list');
+  el.innerHTML = '<div class="loading">加载中...</div>';
+  const offset = page * PAGE_SIZE;
+  const resp = await fetch(`/api/articles?account_id=${selectedAccountId}&limit=${PAGE_SIZE}&offset=${offset}`);
+  const data = await resp.json();
+  loadedArticles = data.items;
+  totalArticles = data.total;
+  renderArticleList();
+  renderPager();
+}
+
+function renderArticleList() {
+  const el = $('#article-list');
+  el.innerHTML = loadedArticles.map(a => `
+    <div class="art-item" data-id="${a.id}" onclick="selectArticle(${a.id})">
+      <div class="art-times">
+        <span>发布 ${fmtTime(a.pub_time)}</span>
+        <span>抓取 ${fmtTime(a.first_seen_at)}</span>
+      </div>
+      <div class="art-title">${h(a.title)}</div>
+      ${a.content ? '' : '<div class="art-meta"><span class="badge badge-no">未抓取</span></div>'}
+    </div>
+  `).join('');
+}
+
+function renderPager() {
+  const totalPages = Math.ceil(totalArticles / PAGE_SIZE);
+  if (totalPages <= 1) {
+    $('#pager').innerHTML = '';
+    return;
+  }
+  $('#pager').innerHTML = `
+    <button onclick="loadPage(0)" ${currentPage === 0 ? 'disabled' : ''}>首页</button>
+    <button onclick="loadPage(${currentPage - 1})" ${currentPage === 0 ? 'disabled' : ''}>上一页</button>
+    <span>${currentPage + 1} / ${totalPages}</span>
+    <button onclick="loadPage(${currentPage + 1})" ${currentPage >= totalPages - 1 ? 'disabled' : ''}>下一页</button>
+    <button onclick="loadPage(${totalPages - 1})" ${currentPage >= totalPages - 1 ? 'disabled' : ''}>末页</button>
+  `;
+}
+
+function selectArticle(id) {
+  if (selectedArticleId === id) return;
+  selectedArticleId = id;
+  $$('.art-item').forEach(el => el.classList.toggle('active', +el.dataset.id === id));
+  const art = loadedArticles.find(a => a.id === id);
+  if (art && art.content) {
+    $('#article-url-bar').style.display = '';
+    $('#article-url-bar').innerHTML = `<a href="${h(art.url)}" target="_blank">原文链接</a>`;
+    const frame = $('#article-view iframe');
+    if (frame) {
+      frame.srcdoc = art.content;
+    } else {
+      $('#article-view').innerHTML = `<iframe class="article-frame" srcdoc="${hAttr(art.content)}"></iframe>`;
+    }
+  } else {
+    const url = art?.url || '#';
+    $('#article-url-bar').style.display = '';
+    $('#article-url-bar').innerHTML = `<a href="${h(url)}" target="_blank">原文链接</a>`;
+    $('#article-view').innerHTML = `<div class="article-empty">该文章尚未抓取内容<br><small><a href="${h(url)}" target="_blank">打开原文</a></small></div>`;
+  }
+}
+
+loadAccounts();
+loadStats();
+</script>
+</body>
+</html>
