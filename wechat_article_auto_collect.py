@@ -103,21 +103,8 @@ def scan_articles(all_regions: bool = False) -> ScanResult:
     return ScanResult(raw_count=len(rows), rows=dedupe(rows))
 
 
-class SaveResult(NamedTuple):
-    scan_id: int
-    new_rows: list[ItemXml]
-
-
-def save_articles(client: Client, result: ScanResult, reason: str, print_scanned: bool) -> SaveResult:
+def save_articles(client: Client, result: ScanResult, reason: str, print_scanned: bool) -> None:
     observed_at = now()
-    scan = client.scan_run.insert(
-        {
-            "started_at": observed_at,
-            "reason": reason,
-            "raw_count": result.raw_count,
-            "item_count": len(result.rows),
-        }
-    )
 
     new_rows: list[ItemXml] = []
     for row in result.rows:
@@ -144,7 +131,7 @@ def save_articles(client: Client, result: ScanResult, reason: str, print_scanned
         existing = client.article.find_first(where={"key": key})
         if existing is None:
             new_rows.append(row)
-            article = client.article.insert(
+            client.article.insert(
                 {
                     "key": key,
                     "account_id": account.id,
@@ -162,7 +149,7 @@ def save_articles(client: Client, result: ScanResult, reason: str, print_scanned
                 }
             )
         else:
-            article = client.article.update(
+            client.article.update(
                 where={"id": existing.id},
                 data={
                     "account_id": account.id,
@@ -176,37 +163,9 @@ def save_articles(client: Client, result: ScanResult, reason: str, print_scanned
                 },
             )
 
-        client.article_observation.upsert(
-            where={"scan_id": scan.id, "article_id": article.id},
-            update={
-                "pid": row.pid,
-                "addr": row.addr,
-                "source_name": row.source_name,
-                "show_name": row.show_name,
-                "source_username": row.source_username,
-                "total_count": row.total_count,
-                "observed_title": row.title,
-                "observed_url": row.url,
-                "observed_at": observed_at,
-            },
-            insert={
-                "scan_id": scan.id,
-                "article_id": article.id,
-                "pid": row.pid,
-                "addr": row.addr,
-                "source_name": row.source_name,
-                "show_name": row.show_name,
-                "source_username": row.source_username,
-                "total_count": row.total_count,
-                "observed_title": row.title,
-                "observed_url": row.url,
-                "observed_at": observed_at,
-            },
-        )
-
     print(
-        f"保存完成: scan_id={scan.id} reason={reason} raw={result.raw_count} "
-        f"items={len(result.rows)} new={len(new_rows)}"
+        f"保存完成: reason={reason} raw={result.raw_count} items={len(result.rows)} "
+        f"new={len(new_rows)}"
     )
     print_rows = result.rows if print_scanned else new_rows
     if not print_rows:
@@ -214,12 +173,10 @@ def save_articles(client: Client, result: ScanResult, reason: str, print_scanned
     else:
         for row in print_rows:
             print(f"  - {row.source_name or row.show_name or row.source_username}: {row.title}")
-    return SaveResult(scan_id=scan.id, new_rows=new_rows)
 
 
 def save_click(
     client: Client,
-    scan_id: int,
     x: int,
     y: int,
     wait_after_click: float,
@@ -228,7 +185,6 @@ def save_click(
 ) -> None:
     client.click_event.insert(
         {
-            "scan_id": scan_id,
             "clicked_at": now(),
             "x": x,
             "y": y,
@@ -237,7 +193,7 @@ def save_click(
             "order_index": order_index,
         }
     )
-    print(f"点击记录: scan_id={scan_id} order={order_index} pos=({x}, {y})")
+    print(f"点击记录: order={order_index} pos=({x}, {y})")
 
 
 def capture_unread_points() -> list[tuple[int, int]]:
@@ -251,8 +207,7 @@ def capture_unread_points() -> list[tuple[int, int]]:
 
 def collect_once(client: Client, wait_after_click: float, max_clicks: int, all_regions: bool, print_all: bool) -> None:
     result = scan_articles(all_regions=all_regions)
-    save_result = save_articles(client, result, "启动扫描", print_scanned=print_all)
-    scan_id = save_result.scan_id
+    save_articles(client, result, "启动扫描", print_scanned=print_all)
 
     clicked = 0
     while clicked < max_clicks:
@@ -269,7 +224,6 @@ def collect_once(client: Client, wait_after_click: float, max_clicks: int, all_r
         click_wechat(click_x, click_y)
         save_click(
             client,
-            scan_id=scan_id,
             x=click_x,
             y=click_y,
             wait_after_click=wait_after_click,
@@ -281,8 +235,7 @@ def collect_once(client: Client, wait_after_click: float, max_clicks: int, all_r
         time.sleep(wait_after_click)
 
         result = scan_articles(all_regions=all_regions)
-        save_result = save_articles(client, result, f"点击红点 {clicked + 1} 后", print_scanned=False)
-        scan_id = save_result.scan_id
+        save_articles(client, result, f"点击红点 {clicked + 1} 后", print_scanned=False)
         clicked += 1
 
     print(f"达到最大点击次数 max_clicks={max_clicks}，停止本轮")
