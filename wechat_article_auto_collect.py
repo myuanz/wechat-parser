@@ -4,14 +4,16 @@ import argparse
 import os
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
-from typing import Literal, NamedTuple
+from typing import Callable, Literal, NamedTuple
 
 import cv2
 import numpy as np
 from dclassql import Client
 
 from common import discover_wechat_pids, role_from_cmdline
+from fetch_wechat_article import DEFAULT_FETCH_DELAY, ArticleFetcher
 from wechat_mem_item_xml_scan import ItemXml, dedupe, scan_pid
 from x11_wechat import capture_wechat_png, click_wechat, move_wechat_mouse
 
@@ -72,10 +74,6 @@ class ScanResult(NamedTuple):
     rows: list[ItemXml]
 
 
-def now() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
-
-
 def article_key(row: ItemXml) -> str:
     return f"{row.biz}:{row.mid}:{row.idx}"
 
@@ -90,7 +88,7 @@ def parse_pub_time(value: str) -> datetime | None:
     timestamp = int(value)
     if timestamp <= 0:
         return None
-    return datetime.fromtimestamp(timestamp, UTC).replace(tzinfo=None)
+    return datetime.fromtimestamp(timestamp, UTC)
 
 
 def scan_articles(all_regions: bool = False) -> ScanResult:
@@ -103,8 +101,14 @@ def scan_articles(all_regions: bool = False) -> ScanResult:
     return ScanResult(raw_count=len(rows), rows=dedupe(rows))
 
 
-def save_articles(client: Client, result: ScanResult, reason: str, print_scanned: bool) -> None:
-    observed_at = now()
+def save_articles(
+    client: Client,
+    result: ScanResult,
+    reason: str,
+    print_scanned: bool,
+    on_new_article: Callable[[int], None] | None = None,
+) -> None:
+    observed_at = datetime.now(UTC)
 
     new_rows: list[ItemXml] = []
     for row in result.rows:
@@ -131,7 +135,7 @@ def save_articles(client: Client, result: ScanResult, reason: str, print_scanned
         existing = client.article.find_first(where={"key": key})
         if existing is None:
             new_rows.append(row)
-            client.article.insert(
+            article = client.article.insert(
                 {
                     "key": key,
                     "account_id": account.id,
@@ -145,9 +149,12 @@ def save_articles(client: Client, result: ScanResult, reason: str, print_scanned
                     "pub_time": parse_pub_time(row.pub_time),
                     "first_seen_at": observed_at,
                     "last_seen_at": observed_at,
+                    "content_fetched_at": None,
                     "seen_count": 1,
                 }
             )
+            if on_new_article is not None:
+                on_new_article(article.id)
         else:
             client.article.update(
                 where={"id": existing.id},
@@ -185,7 +192,7 @@ def save_click(
 ) -> None:
     client.click_event.insert(
         {
-            "clicked_at": now(),
+            "clicked_at": datetime.now(UTC),
             "x": x,
             "y": y,
             "wait_seconds": int(wait_after_click),
@@ -205,9 +212,29 @@ def capture_unread_points() -> list[tuple[int, int]]:
     return points
 
 
-def collect_once(client: Client, wait_after_click: float, max_clicks: int, all_regions: bool, print_all: bool) -> None:
+def log_fetch_error(future: Future[None]) -> None:
+    error = future.exception()
+    if error is not None:
+        print(f"文章内容抓取失败: {error}", file=sys.stderr)
+
+
+def submit_article_fetch(executor: ThreadPoolExecutor, fetcher: ArticleFetcher, article_id: int) -> None:
+    future = executor.submit(fetcher.fetch_article_content_by_id, article_id)
+    future.add_done_callback(log_fetch_error)
+
+
+def collect_once(
+    client: Client,
+    executor: ThreadPoolExecutor,
+    wait_after_click: float,
+    max_clicks: int,
+    all_regions: bool,
+    print_all: bool,
+    fetcher: ArticleFetcher,
+) -> None:
+    on_new_article = lambda article_id: submit_article_fetch(executor, fetcher, article_id)
     result = scan_articles(all_regions=all_regions)
-    save_articles(client, result, "启动扫描", print_scanned=print_all)
+    save_articles(client, result, "启动扫描", print_scanned=print_all, on_new_article=on_new_article)
 
     clicked = 0
     while clicked < max_clicks:
@@ -235,7 +262,13 @@ def collect_once(client: Client, wait_after_click: float, max_clicks: int, all_r
         time.sleep(wait_after_click)
 
         result = scan_articles(all_regions=all_regions)
-        save_articles(client, result, f"点击红点 {clicked + 1} 后", print_scanned=False)
+        save_articles(
+            client,
+            result,
+            f"点击红点 {clicked + 1} 后",
+            print_scanned=False,
+            on_new_article=on_new_article,
+        )
         clicked += 1
 
     print(f"达到最大点击次数 max_clicks={max_clicks}，停止本轮")
@@ -257,6 +290,8 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=0, help="循环间隔秒数；0 表示只跑一轮")
     parser.add_argument("--wait-after-click", type=float, default=5, help="每次点击红点后的等待秒数")
     parser.add_argument("--max-clicks", type=int, default=20, help="单轮最多处理多少个红点")
+    parser.add_argument("--fetch-workers", type=int, default=3, help="后台抓取文章内容的线程数")
+    parser.add_argument("--fetch-delay", type=float, default=DEFAULT_FETCH_DELAY, help="后台抓取文章内容时每次请求之间的间隔秒数")
     parser.add_argument("--all-regions", action="store_true", help="传给内存扫描，扫描更多内存区域")
     parser.add_argument("--reexeced", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -264,13 +299,17 @@ def main() -> None:
     client = Client()
     try:
         print("== 本轮开始 ==")
-        collect_once(
-            client,
-            wait_after_click=args.wait_after_click,
-            max_clicks=args.max_clicks,
-            all_regions=args.all_regions,
-            print_all=not args.reexeced,
-        )
+        fetcher = ArticleFetcher(fetch_delay=args.fetch_delay)
+        with ThreadPoolExecutor(max_workers=args.fetch_workers) as executor:
+            collect_once(
+                client,
+                executor=executor,
+                wait_after_click=args.wait_after_click,
+                max_clicks=args.max_clicks,
+                all_regions=args.all_regions,
+                print_all=not args.reexeced,
+                fetcher=fetcher,
+            )
         print("== 本轮结束 ==")
     finally:
         Client.close_all()
