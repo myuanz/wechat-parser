@@ -191,13 +191,11 @@ def scan_memory_block(pid: int, role: str, base: int, block: bytes) -> list[Item
     return scan_mmreader_text(pid, role, base, block)
 
 
-
-
 def scan_pid(pid: int, all_regions: bool) -> list[ItemXml]:
     role = role_from_cmdline(pid)
     rows: list[ItemXml] = []
     chunk_size = 8 * 1024 * 1024
-    overlap = 1024 * 1024
+    overlap = chunk_size
     with open(f"/proc/{pid}/mem", "rb", buffering=0) as mem:
         for region in read_maps(pid):
             if not region_wanted(region, all_regions):
@@ -224,7 +222,7 @@ def scan_pid(pid: int, all_regions: bool) -> list[ItemXml]:
 def dedupe(rows: list[ItemXml]) -> list[ItemXml]:
     best: dict[tuple[str, str, str], ItemXml] = {}
     for row in rows:
-        key = (row.mid, row.idx, row.title)
+        key = (row.biz, row.mid, row.idx)
         old = best.get(key)
         if old is None:
             best[key] = row

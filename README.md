@@ -13,9 +13,3 @@ uv run python wechat_mem_item_xml_scan.py --out dumps/wechat_item_xml.json
 
 - 不传 PID 时，会自动发现微信主进程并只扫描它
 - 如果显式传了 PID，就按传入的 PID 扫
-- 也支持离线解析主进程 dump：
-
-```bash
-uv run python wechat_mem_item_xml_scan.py --dump-dir dumps/wechat_main_dump \
-  --out dumps/wechat_item_xml_from_dump.json
-```
