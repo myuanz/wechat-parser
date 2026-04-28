@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs
 
 from common import discover_wechat_pids, read_maps, region_wanted, role_from_cmdline
 
@@ -60,8 +60,8 @@ def clean_url(url: str) -> str:
 
 
 def parse_link(url: str) -> tuple[str, str, str]:
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query)
+    query_text = url.partition("?")[2].partition("#")[0]
+    query = parse_qs(query_text)
     return query.get("mid", [""])[0], query.get("idx", [""])[0], query.get("__biz", [""])[0]
 
 
