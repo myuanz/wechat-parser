@@ -17,6 +17,7 @@ PUBLISHER_RE = re.compile(
     re.S,
 )
 ITEM_RE = re.compile(r"<item>(?P<body>.*?)</item>", re.S)
+CATEGORY_NAME_RE = re.compile(r"<name><!\[CDATA\[(.*?)\]\]></name>", re.S)
 CDATA_FIELD_TEMPLATES = {
     "title": re.compile(r"<title><!\[CDATA\[(.*?)\]\]></title>", re.S),
     "url": re.compile(r"<url><!\[CDATA\[(.*?)\]\]></url>", re.S),
@@ -125,12 +126,18 @@ def scan_mmreader_text(pid: int, role: str, base: int, data: bytes) -> list[Item
     for offset, block_bytes in load_mmreader_blocks_bytes(data):
         block = block_bytes.decode("utf-8", errors="ignore")
         count_match = COUNT_RE.search(block)
-        publisher_match = PUBLISHER_RE.search(block)
-        if not count_match or not publisher_match:
+        first_item = block.find("<item>")
+        header = block[:first_item] if first_item >= 0 else block
+        category_end = block.find("</category>")
+        publisher_tail = block[category_end : category_end + 4096] if category_end >= 0 else ""
+        publisher_match = PUBLISHER_RE.search(publisher_tail)
+        category_name_match = CATEGORY_NAME_RE.search(header)
+        if not count_match or (not publisher_match and not category_name_match):
             continue
         total_count = int(count_match.group("count"))
-        source_username = clean_text(publisher_match.group("username"))
-        show_name = clean_text(publisher_match.group("nickname"))
+        source_username = clean_text(publisher_match.group("username")) if publisher_match else ""
+        category_name = clean_text(category_name_match.group(1)) if category_name_match else ""
+        show_name = category_name
         search_from = 0
         for index, match in enumerate(ITEM_RE.finditer(block), start=1):
             body = match.group("body")
@@ -169,12 +176,12 @@ def scan_mmreader_text(pid: int, role: str, base: int, data: bytes) -> list[Item
                     encoding="utf-8",
                     title=title,
                     url=url,
-                    source_name=show_name or source_username,
+                    source_name=show_name,
                     summary=summary,
                     digest=digest,
                     pub_time=pub_time,
                     mid=mid,
-                    idx=idx or str(index),
+                    idx=idx,
                     biz=biz,
                     source_username=source_username,
                     total_count=total_count,
@@ -259,7 +266,7 @@ def main() -> None:
     for row in result:
         print(
             f"pid={row.pid} mid={row.mid} idx={row.idx} total={row.total_count} "
-            f"source={row.show_name or row.source_name or row.source_username} title={row.title}"
+            f"source={row.source_name} title={row.title}"
         )
         print(f"  {row.url}")
 

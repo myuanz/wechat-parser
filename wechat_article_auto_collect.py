@@ -14,11 +14,14 @@ from dclassql import Client
 
 from common import discover_wechat_pids, role_from_cmdline
 from fetch_wechat_article import DEFAULT_FETCH_DELAY, ArticleFetcher
-from wechat_mem_item_xml_scan import ItemXml, dedupe, scan_pid
+from wechat_mem_item_xml_scan import ItemXml, dedupe
+from wechat_mem_item_xml_scan import scan_pid as scan_pid_matcher
+from wechat_mem_xml_parse_scan import scan_pid as scan_pid_parser
 from x11_wechat import capture_wechat_png, click_wechat, move_wechat_mouse
 
 
 Stage = Literal["init", "flow", "tab"]
+Scanner = Literal["parser", "matcher"]
 
 
 def to_ch4(img: np.ndarray) -> np.ndarray:
@@ -91,12 +94,13 @@ def parse_pub_time(value: str) -> datetime | None:
     return datetime.fromtimestamp(timestamp, UTC)
 
 
-def scan_articles(all_regions: bool = False) -> ScanResult:
+def scan_articles(scanner: Scanner, all_regions: bool = False) -> ScanResult:
     rows: list[ItemXml] = []
+    scan_pid = scan_pid_parser if scanner == "parser" else scan_pid_matcher
     pids = [pid for pid in discover_wechat_pids() if role_from_cmdline(pid) == "wechat-main"]
     for pid in pids:
         current = scan_pid(pid, all_regions)
-        print(f"内存扫描: pid={pid} role={role_from_cmdline(pid)} raw_items={len(current)}")
+        print(f"内存扫描: scanner={scanner} pid={pid} role={role_from_cmdline(pid)} raw_items={len(current)}")
         rows.extend(current)
     return ScanResult(raw_count=len(rows), rows=dedupe(rows))
 
@@ -229,11 +233,12 @@ def collect_once(
     wait_after_click: float,
     max_clicks: int,
     all_regions: bool,
+    scanner: Scanner,
     print_all: bool,
     fetcher: ArticleFetcher,
 ) -> None:
     on_new_article = lambda article_id: submit_article_fetch(executor, fetcher, article_id)
-    result = scan_articles(all_regions=all_regions)
+    result = scan_articles(scanner=scanner, all_regions=all_regions)
     save_articles(client, result, "启动扫描", print_scanned=print_all, on_new_article=on_new_article)
 
     clicked = 0
@@ -261,7 +266,7 @@ def collect_once(
         print(f"等待: {wait_after_click:g}s")
         time.sleep(wait_after_click)
 
-        result = scan_articles(all_regions=all_regions)
+        result = scan_articles(scanner=scanner, all_regions=all_regions)
         save_articles(
             client,
             result,
@@ -293,6 +298,7 @@ def main() -> None:
     parser.add_argument("--fetch-workers", type=int, default=3, help="后台抓取文章内容的线程数")
     parser.add_argument("--fetch-delay", type=float, default=DEFAULT_FETCH_DELAY, help="后台抓取文章内容时每次请求之间的间隔秒数")
     parser.add_argument("--all-regions", action="store_true", help="传给内存扫描，扫描更多内存区域")
+    parser.add_argument("--scanner", choices=["parser", "matcher"], default="parser", help="内存扫描实现；parser=严格 XML 解析，matcher=旧文本匹配")
     parser.add_argument("--reexeced", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -307,6 +313,7 @@ def main() -> None:
                 wait_after_click=args.wait_after_click,
                 max_clicks=args.max_clicks,
                 all_regions=args.all_regions,
+                scanner=args.scanner,
                 print_all=not args.reexeced,
                 fetcher=fetcher,
             )
