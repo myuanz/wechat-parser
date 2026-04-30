@@ -23,6 +23,10 @@ def _decompress(html_zstd: bytes | None) -> str | None:
     return zstd.decompress(html_zstd).decode("utf-8")
 
 
+def _normalize_dt(value: str) -> str:
+    return datetime.fromisoformat(value).isoformat()
+
+
 def _article_json(art: Article, content: str | None = None) -> dict:
     return {
         "id": art.id,
@@ -93,23 +97,23 @@ def api_articles(
         if account_id is not None:
             where["account_id"] = account_id
         if pub_time_from or pub_time_to:
-            # pub_time is nullable; use raw SQL for range filter
-            pass
+            pub_time_filter: dict[str, str] = {}
+            if pub_time_from:
+                pub_time_filter["gte"] = _normalize_dt(pub_time_from)
+            if pub_time_to:
+                pub_time_filter["lte"] = _normalize_dt(pub_time_to)
+            where["pub_time"] = pub_time_filter
 
         articles = client.article.find_many(
             where=where,
             include={"content": ArticleContent},
-            order_by={"first_seen_at": "desc"},
+            order_by={"pub_time": "desc"},
             take=limit,
             skip=offset,
         )
 
         result: list[dict] = []
         for art in articles:
-            if pub_time_from and (art.pub_time is None or art.pub_time < datetime.fromisoformat(pub_time_from)):
-                continue
-            if pub_time_to and (art.pub_time is None or art.pub_time > datetime.fromisoformat(pub_time_to)):
-                continue
             content_html = _decompress(art.content.normalized_html_zstd) if art.content else None
             content = None
             if content_html:
@@ -126,16 +130,13 @@ def api_articles(
                 count_params.append(account_id)
             if pub_time_from:
                 count_sql += " AND pub_time >= ?"
-                count_params.append(pub_time_from)
+                count_params.append(_normalize_dt(pub_time_from))
             if pub_time_to:
                 count_sql += " AND pub_time <= ?"
-                count_params.append(pub_time_to)
+                count_params.append(_normalize_dt(pub_time_to))
             total = db.execute(count_sql, count_params).fetchone()[0]
         finally:
             db.close()
-
-        if pub_time_from or pub_time_to:
-            result = result[offset : offset + limit]
 
         return {"items": result, "total": total, "limit": limit, "offset": offset}
     finally:
