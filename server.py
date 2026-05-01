@@ -5,7 +5,7 @@ from pathlib import Path
 import html_to_markdown
 from compression import zstd
 from dclassql import Client
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from db_model import Account, Article, ArticleContent
@@ -46,6 +46,53 @@ def _article_json(art: Article, content: str | None = None) -> dict:
         "seen_count": art.seen_count,
         "content": content,
     }
+
+
+def _article_list_json(art: Article) -> dict:
+    data = _article_json(art)
+    data.pop("content")
+    data["has_content"] = art.content_fetched_at is not None
+    return data
+
+
+def _article_where(account_id: int | None, pub_time_from: str | None, pub_time_to: str | None) -> dict:
+    where: dict = {}
+    if account_id is not None:
+        where["account_id"] = account_id
+    if pub_time_from or pub_time_to:
+        pub_time_filter: dict[str, str] = {}
+        if pub_time_from:
+            pub_time_filter["gte"] = _normalize_dt(pub_time_from)
+        if pub_time_to:
+            pub_time_filter["lte"] = _normalize_dt(pub_time_to)
+        where["pub_time"] = pub_time_filter
+    return where
+
+
+def _article_total(account_id: int | None, pub_time_from: str | None, pub_time_to: str | None) -> int:
+    db = _db()
+    try:
+        count_sql = "SELECT COUNT(*) FROM Article WHERE 1=1"
+        count_params: list = []
+        if account_id is not None:
+            count_sql += " AND account_id = ?"
+            count_params.append(account_id)
+        if pub_time_from:
+            count_sql += " AND pub_time >= ?"
+            count_params.append(_normalize_dt(pub_time_from))
+        if pub_time_to:
+            count_sql += " AND pub_time <= ?"
+            count_params.append(_normalize_dt(pub_time_to))
+        return db.execute(count_sql, count_params).fetchone()[0]
+    finally:
+        db.close()
+
+
+def _article_content(art: Article, format: str | None) -> str | None:
+    content_html = _decompress(art.content.normalized_html_zstd) if art.content else None
+    if content_html is None:
+        return None
+    return html_to_markdown.convert(content_html).content if format == "markdown" else content_html
 
 
 # ── page ──────────────────────────────────────────────────
@@ -93,19 +140,8 @@ def api_articles(
 ):
     client = Client()
     try:
-        where: dict = {}
-        if account_id is not None:
-            where["account_id"] = account_id
-        if pub_time_from or pub_time_to:
-            pub_time_filter: dict[str, str] = {}
-            if pub_time_from:
-                pub_time_filter["gte"] = _normalize_dt(pub_time_from)
-            if pub_time_to:
-                pub_time_filter["lte"] = _normalize_dt(pub_time_to)
-            where["pub_time"] = pub_time_filter
-
         articles = client.article.find_many(
-            where=where,
+            where=_article_where(account_id, pub_time_from, pub_time_to),
             include={"content": ArticleContent},
             order_by={"pub_time": "desc"},
             take=limit,
@@ -114,31 +150,52 @@ def api_articles(
 
         result: list[dict] = []
         for art in articles:
-            content_html = _decompress(art.content.normalized_html_zstd) if art.content else None
-            content = None
-            if content_html:
-                content = html_to_markdown.convert(content_html).content if format == "markdown" else content_html
-            result.append(_article_json(art, content))
+            result.append(_article_json(art, _article_content(art, format)))
 
-        # get total count with correct filters
-        db = _db()
-        try:
-            count_sql = "SELECT COUNT(*) FROM Article WHERE 1=1"
-            count_params: list = []
-            if account_id is not None:
-                count_sql += " AND account_id = ?"
-                count_params.append(account_id)
-            if pub_time_from:
-                count_sql += " AND pub_time >= ?"
-                count_params.append(_normalize_dt(pub_time_from))
-            if pub_time_to:
-                count_sql += " AND pub_time <= ?"
-                count_params.append(_normalize_dt(pub_time_to))
-            total = db.execute(count_sql, count_params).fetchone()[0]
-        finally:
-            db.close()
+        return {
+            "items": result,
+            "total": _article_total(account_id, pub_time_from, pub_time_to),
+            "limit": limit,
+            "offset": offset,
+        }
+    finally:
+        Client.close_all()
 
-        return {"items": result, "total": total, "limit": limit, "offset": offset}
+
+@app.get("/api/article-list")
+def api_article_list(
+    pub_time_from: str | None = Query(None, description="ISO datetime, eg 2025-01-01 or 2025-01-01T00:00:00"),
+    pub_time_to: str | None = Query(None, description="ISO datetime"),
+    account_id: int | None = Query(None),
+    limit: int = Query(50, ge=1),
+    offset: int = Query(0, ge=0),
+):
+    client = Client()
+    try:
+        articles = client.article.find_many(
+            where=_article_where(account_id, pub_time_from, pub_time_to),
+            order_by={"pub_time": "desc"},
+            take=limit,
+            skip=offset,
+        )
+        return {
+            "items": [_article_list_json(art) for art in articles],
+            "total": _article_total(account_id, pub_time_from, pub_time_to),
+            "limit": limit,
+            "offset": offset,
+        }
+    finally:
+        Client.close_all()
+
+
+@app.get("/api/articles/{article_id}")
+def api_article(article_id: int, format: str | None = Query("html", description="'html'（默认）或 'markdown'")):
+    client = Client()
+    try:
+        art = client.article.find_first(where={"id": article_id}, include={"content": ArticleContent})
+        if art is None:
+            raise HTTPException(status_code=404, detail="article not found")
+        return _article_json(art, _article_content(art, format))
     finally:
         Client.close_all()
 

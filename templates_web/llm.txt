@@ -22,13 +22,62 @@ Base URL: https://wechat.mkyr.fun
 ```
 
 字段说明:
-- id: 内部 ID，用于 /api/articles 的 account_id 过滤
+- id: 内部 ID，用于 /api/article-list 和 /api/articles 的 account_id 过滤
 - biz: 微信公众号 base64 标识
 - username: gh_* 格式的微信号
 
+## GET /api/article-list
+
+获取轻量文章列表。默认每页 50 条，按发布时间倒序。该接口不返回正文，适合网页列表、分页和检索入口。
+
+请求参数（均为可选）:
+- account_id: int          — 按公众号 ID 过滤
+- pub_time_from: str       — 发布时间起始（ISO 格式，如 "2026-04-01" 或 "2026-04-01T00:00:00"）
+- pub_time_to: str         — 发布时间截止
+- limit: int (默认 50)      — 每页条数，无上限
+- offset: int (默认 0)      — 分页偏移
+
+示例:
+```
+GET /api/article-list?account_id=1&limit=20&offset=0
+```
+
+响应: application/json
+```json
+{
+  "items": [
+    {
+      "id": 19,
+      "key": "MzAwNjY4MjQwMA==:2650559430:1",
+      "account_id": 1,
+      "biz": "MzAwNjY4MjQwMA==",
+      "mid": "2650559430",
+      "idx": "1",
+      "title": "放量了",
+      "url": "http://mp.weixin.qq.com/s?__biz=...",
+      "digest": "",
+      "summary": "【重要提示】...",
+      "pub_time": "2026-04-23T09:03:52",
+      "first_seen_at": "2026-04-26T15:09:53.853017",
+      "last_seen_at": "2026-04-27T03:07:27.178135",
+      "content_fetched_at": "2026-04-27T04:23:01.985732",
+      "seen_count": 145,
+      "has_content": true
+    }
+  ],
+  "total": 23,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+字段说明:
+- has_content: 是否已经抓取到正文
+- total: 符合过滤条件的文章总数，用于分页
+
 ## GET /api/articles
 
-获取文章列表。默认每页 50 条，按抓取时间倒序。
+获取完整文章列表。默认每页 50 条，按发布时间倒序。该接口会返回正文，适合外部调用方批量获取完整内容；网页列表请优先使用 /api/article-list。
 
 请求参数（均为可选）:
 - account_id: int          — 按公众号 ID 过滤
@@ -80,6 +129,20 @@ GET /api/articles?account_id=1&pub_time_from=2026-04-01&limit=20&offset=0&format
 - content_fetched_at: 正文抓取完成时间（UTC），null 表示尚未抓取
 - seen_count: 在微信内存中出现的次数（含去重）
 - total: 符合过滤条件的文章总数，用于分页
+
+## GET /api/articles/{article_id}
+
+获取单篇完整文章。
+
+请求参数:
+- format: str (默认 "html") — "html" 返回原始 HTML，设为 "markdown" 返回 Markdown 文本
+
+示例:
+```
+GET /api/articles/19?format=html
+```
+
+响应字段同 /api/articles 的 items 单项。
 
 ## GET /api/stats
 

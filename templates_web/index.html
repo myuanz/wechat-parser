@@ -80,6 +80,7 @@ const $$ = (s) => document.querySelectorAll(s);
 const PAGE_SIZE = 30;
 let accounts = [], loadedArticles = [], selectedAccountId = null, selectedArticleId = null,
     currentPage = 0, totalArticles = 0;
+const articleCache = new Map();
 
 function h(s) {
   if (!s) return '';
@@ -120,6 +121,7 @@ async function selectAccount(id) {
   selectedAccountId = id;
   selectedArticleId = null;
   loadedArticles = [];
+  articleCache.clear();
   currentPage = 0;
   $$('.acct-item').forEach(el => el.classList.toggle('active', +el.dataset.id === id));
   $$('.art-item').forEach(el => el.classList.remove('active'));
@@ -134,7 +136,7 @@ async function loadPage(page) {
   const el = $('#article-list');
   el.innerHTML = '<div class="loading">加载中...</div>';
   const offset = page * PAGE_SIZE;
-  const resp = await fetch(`/api/articles?account_id=${selectedAccountId}&limit=${PAGE_SIZE}&offset=${offset}`);
+  const resp = await fetch(`/api/article-list?account_id=${selectedAccountId}&limit=${PAGE_SIZE}&offset=${offset}`);
   const data = await resp.json();
   loadedArticles = data.items;
   totalArticles = data.total;
@@ -151,7 +153,7 @@ function renderArticleList() {
         <span>抓取 ${fmtTime(a.first_seen_at)}</span>
       </div>
       <div class="art-title">${h(a.title)}</div>
-      ${a.content ? '' : '<div class="art-meta"><span class="badge badge-no">未抓取</span></div>'}
+      ${a.has_content ? '' : '<div class="art-meta"><span class="badge badge-no">未抓取</span></div>'}
     </div>
   `).join('');
 }
@@ -171,19 +173,27 @@ function renderPager() {
   `;
 }
 
-function selectArticle(id) {
+async function selectArticle(id) {
   if (selectedArticleId === id) return;
   selectedArticleId = id;
   $$('.art-item').forEach(el => el.classList.toggle('active', +el.dataset.id === id));
   const art = loadedArticles.find(a => a.id === id);
-  if (art && art.content) {
+  if (art?.has_content) {
     $('#article-url-bar').style.display = '';
     $('#article-url-bar').innerHTML = `<a href="${h(art.url)}" target="_blank">原文链接</a>`;
+    $('#article-view').innerHTML = '<div class="article-empty">加载中...</div>';
+    const detail = articleCache.get(id) || await fetch(`/api/articles/${id}`).then(resp => resp.json());
+    articleCache.set(id, detail);
+    if (selectedArticleId !== id) return;
+    if (!detail.content) {
+      $('#article-view').innerHTML = `<div class="article-empty">该文章尚未抓取内容<br><small><a href="${h(art.url)}" target="_blank">打开原文</a></small></div>`;
+      return;
+    }
     const frame = $('#article-view iframe');
     if (frame) {
-      frame.srcdoc = art.content;
+      frame.srcdoc = detail.content;
     } else {
-      $('#article-view').innerHTML = `<iframe class="article-frame" srcdoc="${hAttr(art.content)}"></iframe>`;
+      $('#article-view').innerHTML = `<iframe class="article-frame" srcdoc="${hAttr(detail.content)}"></iframe>`;
     }
   } else {
     const url = art?.url || '#';
