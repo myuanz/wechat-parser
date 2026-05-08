@@ -295,7 +295,6 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=0, help="循环间隔秒数；0 表示只跑一轮")
     parser.add_argument("--wait-after-click", type=float, default=5, help="每次点击红点后的等待秒数")
     parser.add_argument("--max-clicks", type=int, default=20, help="单轮最多处理多少个红点")
-    parser.add_argument("--fetch-workers", type=int, default=3, help="后台抓取文章内容的线程数")
     parser.add_argument("--fetch-delay", type=float, default=DEFAULT_FETCH_DELAY, help="后台抓取文章内容时每次请求之间的间隔秒数")
     parser.add_argument("--all-regions", action="store_true", help="传给内存扫描，扫描更多内存区域")
     parser.add_argument("--scanner", choices=["parser", "matcher"], default="parser", help="内存扫描实现；parser=严格 XML 解析，matcher=旧文本匹配")
@@ -306,7 +305,7 @@ def main() -> None:
     try:
         print("== 本轮开始 ==")
         fetcher = ArticleFetcher(fetch_delay=args.fetch_delay)
-        with ThreadPoolExecutor(max_workers=args.fetch_workers) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor:
             collect_once(
                 client,
                 executor=executor,
