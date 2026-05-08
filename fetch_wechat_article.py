@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from compression import zstd
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import random
 import sys
@@ -26,6 +26,32 @@ DEFAULT_FETCH_DELAY = 3.0
 FETCH_STATE_DIR = Path(tempfile.gettempdir())
 FETCH_LOCK_PATH = FETCH_STATE_DIR / "wechat_article_fetch.lock"
 FETCH_STAMP_PATH = FETCH_STATE_DIR / "wechat_article_fetch.last"
+MAX_RETRIES = 5
+RETRY_DELAYS = [
+    timedelta(minutes=10),
+    timedelta(hours=1),
+    timedelta(hours=6),
+    timedelta(hours=24),
+    timedelta(hours=72),
+]
+
+
+def next_retry_at(retry_count: int, now: datetime) -> datetime | None:
+    if retry_count >= MAX_RETRIES:
+        return None
+    return now + RETRY_DELAYS[retry_count - 1]
+
+
+def should_fetch_article(article) -> bool:
+    if article.content_fetched_at is not None:
+        return False
+    if article.content is None:
+        return True
+    if article.content.status == "pending":
+        return True
+    if article.content.status != "failed":
+        return False
+    return article.content.next_retry_at is not None and article.content.next_retry_at <= datetime.now(UTC)
 
 
 def is_valid_mp_article_url(url: str) -> bool:
@@ -185,6 +211,8 @@ class ArticleFetcher:
                     "url": url,
                     "normalized_html_zstd": compressed_html,
                     "status": "fetched",
+                    "retry_count": 0,
+                    "next_retry_at": None,
                     "fetch_error": None,
                     "fetched_at": updated_at,
                     "updated_at": updated_at,
@@ -194,6 +222,8 @@ class ArticleFetcher:
                     "url": url,
                     "normalized_html_zstd": compressed_html,
                     "status": "fetched",
+                    "retry_count": 0,
+                    "next_retry_at": None,
                     "fetch_error": None,
                     "fetched_at": updated_at,
                     "updated_at": updated_at,
@@ -204,24 +234,36 @@ class ArticleFetcher:
                 data={"content_fetched_at": updated_at},
             )
         except Exception as error:
+            existing = client.article_content.find_first(where={"article_id": article_id})
+            retry_count = (existing.retry_count if existing else 0) + 1
+            status = "give_up" if retry_count >= MAX_RETRIES else "failed"
             client.article_content.upsert(
                 where={"article_id": article_id},
                 update={
                     "url": url,
                     "normalized_html_zstd": None,
-                    "status": "failed",
+                    "status": status,
+                    "retry_count": retry_count,
+                    "next_retry_at": next_retry_at(retry_count, updated_at),
                     "fetch_error": str(error),
+                    "fetched_at": None,
                     "updated_at": updated_at,
                 },
                 insert={
                     "article_id": article_id,
                     "url": url,
                     "normalized_html_zstd": None,
-                    "status": "failed",
+                    "status": status,
+                    "retry_count": retry_count,
+                    "next_retry_at": next_retry_at(retry_count, updated_at),
                     "fetch_error": str(error),
                     "fetched_at": None,
                     "updated_at": updated_at,
                 },
+            )
+            client.article.update(
+                where={"id": article_id},
+                data={"content_fetched_at": None},
             )
             raise
 
@@ -241,11 +283,14 @@ class ArticleFetcher:
         try:
             articles = client.article.find_many(
                 where={"content_fetched_at": None},
+                include={"content": True},
                 order_by={"first_seen_at": "asc"},
             )
             for article in articles:
                 if limit is not None and fetched >= limit:
                     return
+                if not should_fetch_article(article):
+                    continue
 
                 print(f"抓取文章: article_id={article.id} title={article.title}")
                 try:

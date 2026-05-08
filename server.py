@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import html_to_markdown
@@ -8,7 +8,7 @@ from dclassql import Client
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
-from db_model import Account, Article, ArticleContent
+from db_model import Article
 
 app = FastAPI(title="wechat-parser")
 
@@ -28,6 +28,7 @@ def _normalize_dt(value: str) -> str:
 
 
 def _article_json(art: Article, content: str | None = None) -> dict:
+    content_row = art.content
     return {
         "id": art.id,
         "key": art.key,
@@ -44,6 +45,10 @@ def _article_json(art: Article, content: str | None = None) -> dict:
         "last_seen_at": art.last_seen_at.isoformat(),
         "content_fetched_at": art.content_fetched_at.isoformat() if art.content_fetched_at else None,
         "seen_count": art.seen_count,
+        "fetch_status": content_row.status if content_row else "pending",
+        "retry_count": content_row.retry_count if content_row else 0,
+        "next_retry_at": content_row.next_retry_at.isoformat() if content_row and content_row.next_retry_at else None,
+        "fetch_error": content_row.fetch_error if content_row else None,
         "content": content,
     }
 
@@ -51,7 +56,7 @@ def _article_json(art: Article, content: str | None = None) -> dict:
 def _article_list_json(art: Article) -> dict:
     data = _article_json(art)
     data.pop("content")
-    data["has_content"] = art.content_fetched_at is not None
+    data["has_content"] = art.content_fetched_at is not None and data["fetch_status"] == "fetched"
     return data
 
 
@@ -69,23 +74,8 @@ def _article_where(account_id: int | None, pub_time_from: str | None, pub_time_t
     return where
 
 
-def _article_total(account_id: int | None, pub_time_from: str | None, pub_time_to: str | None) -> int:
-    db = _db()
-    try:
-        count_sql = "SELECT COUNT(*) FROM Article WHERE 1=1"
-        count_params: list = []
-        if account_id is not None:
-            count_sql += " AND account_id = ?"
-            count_params.append(account_id)
-        if pub_time_from:
-            count_sql += " AND pub_time >= ?"
-            count_params.append(_normalize_dt(pub_time_from))
-        if pub_time_to:
-            count_sql += " AND pub_time <= ?"
-            count_params.append(_normalize_dt(pub_time_to))
-        return db.execute(count_sql, count_params).fetchone()[0]
-    finally:
-        db.close()
+def _article_total(client: Client, account_id: int | None, pub_time_from: str | None, pub_time_to: str | None) -> int:
+    return len(client.article.find_many(where=_article_where(account_id, pub_time_from, pub_time_to)))
 
 
 def _article_content(art: Article, format: str | None) -> str | None:
@@ -142,7 +132,7 @@ def api_articles(
     try:
         articles = client.article.find_many(
             where=_article_where(account_id, pub_time_from, pub_time_to),
-            include={"content": ArticleContent},
+            include={"content": True},
             order_by={"pub_time": "desc"},
             take=limit,
             skip=offset,
@@ -154,7 +144,7 @@ def api_articles(
 
         return {
             "items": result,
-            "total": _article_total(account_id, pub_time_from, pub_time_to),
+            "total": _article_total(client, account_id, pub_time_from, pub_time_to),
             "limit": limit,
             "offset": offset,
         }
@@ -174,13 +164,14 @@ def api_article_list(
     try:
         articles = client.article.find_many(
             where=_article_where(account_id, pub_time_from, pub_time_to),
+            include={"content": True},
             order_by={"pub_time": "desc"},
             take=limit,
             skip=offset,
         )
         return {
             "items": [_article_list_json(art) for art in articles],
-            "total": _article_total(account_id, pub_time_from, pub_time_to),
+            "total": _article_total(client, account_id, pub_time_from, pub_time_to),
             "limit": limit,
             "offset": offset,
         }
@@ -192,10 +183,54 @@ def api_article_list(
 def api_article(article_id: int, format: str | None = Query("html", description="'html'（默认）或 'markdown'")):
     client = Client()
     try:
-        art = client.article.find_first(where={"id": article_id}, include={"content": ArticleContent})
+        art = client.article.find_first(where={"id": article_id}, include={"content": True})
         if art is None:
             raise HTTPException(status_code=404, detail="article not found")
         return _article_json(art, _article_content(art, format))
+    finally:
+        Client.close_all()
+
+
+@app.post("/api/articles/{article_id}/retry-fetch")
+def api_retry_fetch(article_id: int):
+    client = Client()
+    try:
+        article = client.article.find_first(where={"id": article_id})
+        if article is None:
+            raise HTTPException(status_code=404, detail="article not found")
+
+        now = datetime.now(UTC)
+        client.article_content.upsert(
+            where={"article_id": article_id},
+            update={
+                "url": article.url,
+                "normalized_html_zstd": None,
+                "status": "pending",
+                "retry_count": 0,
+                "next_retry_at": now,
+                "fetch_error": None,
+                "fetched_at": None,
+                "updated_at": now,
+            },
+            insert={
+                "article_id": article_id,
+                "url": article.url,
+                "normalized_html_zstd": None,
+                "status": "pending",
+                "retry_count": 0,
+                "next_retry_at": now,
+                "fetch_error": None,
+                "fetched_at": None,
+                "updated_at": now,
+            },
+        )
+        client.article.update(where={"id": article_id}, data={"content_fetched_at": None})
+        return {
+            "article_id": article_id,
+            "status": "pending",
+            "retry_count": 0,
+            "next_retry_at": now.isoformat(),
+        }
     finally:
         Client.close_all()
 
@@ -206,9 +241,35 @@ def api_stats():
     try:
         db = _db()
         try:
+            now = datetime.now(UTC).isoformat()
             total_accounts = db.execute("SELECT COUNT(*) FROM Account").fetchone()[0]
             total_articles = db.execute("SELECT COUNT(*) FROM Article").fetchone()[0]
-            fetched = db.execute("SELECT COUNT(*) FROM ArticleContent WHERE status='fetched'").fetchone()[0]
+            fetched = db.execute("SELECT COUNT(*) FROM ArticleContent WHERE status = 'fetched'").fetchone()[0]
+            failed = db.execute("SELECT COUNT(*) FROM ArticleContent WHERE status = 'failed'").fetchone()[0]
+            give_up = db.execute("SELECT COUNT(*) FROM ArticleContent WHERE status = 'give_up'").fetchone()[0]
+            pending = db.execute(
+                """
+                SELECT COUNT(*)
+                FROM Article a
+                LEFT JOIN ArticleContent c ON c.article_id = a.id
+                WHERE a.content_fetched_at IS NULL
+                AND (c.article_id IS NULL OR c.status = 'pending')
+                """
+            ).fetchone()[0]
+            retryable = db.execute(
+                """
+                SELECT COUNT(*)
+                FROM Article a
+                LEFT JOIN ArticleContent c ON c.article_id = a.id
+                WHERE a.content_fetched_at IS NULL
+                AND (
+                    c.article_id IS NULL
+                    OR c.status = 'pending'
+                    OR (c.status = 'failed' AND c.next_retry_at <= ?)
+                )
+                """,
+                [now],
+            ).fetchone()[0]
         finally:
             db.close()
 
@@ -218,6 +279,10 @@ def api_stats():
             "total_accounts": total_accounts,
             "total_articles": total_articles,
             "fetched_articles": fetched,
+            "pending_articles": pending,
+            "failed_articles": failed,
+            "give_up_articles": give_up,
+            "retryable_articles": retryable,
             "latest_article_at": latest.first_seen_at.isoformat() if latest else None,
             "last_collect_at": last.last_seen_at.isoformat() if last else None,
         }

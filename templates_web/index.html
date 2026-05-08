@@ -29,7 +29,12 @@
   .art-meta { font-size: 12px; color: #999; display: flex; gap: 8px; }
   .art-meta .badge { color: #fff; font-size: 11px; padding: 1px 6px; border-radius: 3px; }
   .badge-ok { background: #52c41a; }
-  .badge-no { background: #faad14; }
+  .badge-pending { background: #1a6feb; }
+  .badge-failed { background: #faad14; }
+  .badge-give-up { background: #d4380d; }
+  .retry-btn { border: 1px solid #ddd; background: #fff; color: #1a6feb; font-size: 11px; padding: 1px 6px; border-radius: 3px; cursor: pointer; }
+  .retry-btn:hover { border-color: #1a6feb; background: #f0f5ff; }
+  .retry-btn:disabled { color: #aaa; cursor: default; background: #f5f5f5; border-color: #ddd; }
 
   #pager { flex-shrink: 0; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 10px; border-top: 1px solid #eee; font-size: 13px; }
   #pager button { border: 1px solid #ddd; background: #fff; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
@@ -90,6 +95,7 @@ function h(s) {
 }
 
 function hAttr(s) {
+  if (!s) return '';
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
@@ -114,7 +120,7 @@ async function loadAccounts() {
 async function loadStats() {
   const resp = await fetch('/api/stats');
   const s = await resp.json();
-  $('#stats-bar').innerHTML = `共 ${s.total_accounts} 个公众号<br>${s.total_articles} 篇文章<br>已抓取 ${s.fetched_articles} 篇<br><span style="font-size:10px">上次采集 ${fmtTime(s.last_collect_at)}</span>`;
+  $('#stats-bar').innerHTML = `共 ${s.total_accounts} 个公众号<br>${s.total_articles} 篇文章<br>已抓取 ${s.fetched_articles} 篇<br>待抓取 ${s.pending_articles} 篇<br>失败 ${s.failed_articles} 篇<br>已放弃 ${s.give_up_articles} 篇<br><span style="font-size:10px">上次采集 ${fmtTime(s.last_collect_at)}</span>`;
 }
 
 async function selectAccount(id) {
@@ -147,15 +153,42 @@ async function loadPage(page) {
 function renderArticleList() {
   const el = $('#article-list');
   el.innerHTML = loadedArticles.map(a => `
-    <div class="art-item" data-id="${a.id}" onclick="selectArticle(${a.id})">
+    <div class="art-item ${selectedArticleId === a.id ? 'active' : ''}" data-id="${a.id}" onclick="selectArticle(${a.id})">
       <div class="art-times">
         <span>发布 ${fmtTime(a.pub_time)}</span>
         <span>抓取 ${fmtTime(a.first_seen_at)}</span>
       </div>
       <div class="art-title">${h(a.title)}</div>
-      ${a.has_content ? '' : '<div class="art-meta"><span class="badge badge-no">未抓取</span></div>'}
+      ${articleStatusHtml(a)}
     </div>
   `).join('');
+}
+
+function fetchStatusText(a) {
+  if (a.has_content || a.fetch_status === 'fetched') return '已抓取';
+  if (a.fetch_status === 'failed') return '等待重试';
+  if (a.fetch_status === 'give_up') return '已放弃';
+  return '等待抓取';
+}
+
+function fetchStatusClass(a) {
+  if (a.fetch_status === 'failed') return 'badge-failed';
+  if (a.fetch_status === 'give_up') return 'badge-give-up';
+  return 'badge-pending';
+}
+
+function articleStatusHtml(a) {
+  if (a.has_content) return '';
+  const retryText = a.retry_count ? `失败 ${a.retry_count} 次` : '';
+  const nextRetry = a.next_retry_at ? `下次 ${fmtTime(a.next_retry_at)}` : '';
+  const detail = [retryText, nextRetry].filter(Boolean).join(' / ');
+  return `
+    <div class="art-meta">
+      <span class="badge ${fetchStatusClass(a)}" title="${hAttr(a.fetch_error || '')}">${fetchStatusText(a)}</span>
+      ${detail ? `<span>${h(detail)}</span>` : ''}
+      <button class="retry-btn" data-retry-id="${a.id}" onclick="retryFetch(event, ${a.id})">加入重试</button>
+    </div>
+  `;
 }
 
 function renderPager() {
@@ -180,7 +213,7 @@ async function selectArticle(id) {
   const art = loadedArticles.find(a => a.id === id);
   if (art?.has_content) {
     $('#article-url-bar').style.display = '';
-    $('#article-url-bar').innerHTML = `<a href="${h(art.url)}" target="_blank">原文链接</a>`;
+    $('#article-url-bar').innerHTML = `<a href="${hAttr(art.url)}" target="_blank">原文链接</a>`;
     $('#article-view').innerHTML = '<div class="article-empty">加载中...</div>';
     const detail = articleCache.get(id) || await fetch(`/api/articles/${id}`).then(resp => resp.json());
     articleCache.set(id, detail);
@@ -198,8 +231,37 @@ async function selectArticle(id) {
   } else {
     const url = art?.url || '#';
     $('#article-url-bar').style.display = '';
-    $('#article-url-bar').innerHTML = `<a href="${h(url)}" target="_blank">原文链接</a>`;
-    $('#article-view').innerHTML = `<div class="article-empty">该文章尚未抓取内容<br><small><a href="${h(url)}" target="_blank">打开原文</a></small></div>`;
+    $('#article-url-bar').innerHTML = `<a href="${hAttr(url)}" target="_blank">原文链接</a>`;
+    $('#article-view').innerHTML = `<div class="article-empty">${fetchStatusText(art)}<br><small><a href="${hAttr(url)}" target="_blank">打开原文</a></small></div>`;
+  }
+}
+
+async function retryFetch(event, id) {
+  event.stopPropagation();
+  const btn = event.currentTarget;
+  btn.disabled = true;
+  btn.textContent = '已加入';
+  const resp = await fetch(`/api/articles/${id}/retry-fetch`, { method: 'POST' });
+  if (!resp.ok) {
+    btn.disabled = false;
+    btn.textContent = '加入重试';
+    return;
+  }
+  const result = await resp.json();
+  const art = loadedArticles.find(a => a.id === id);
+  if (art) {
+    art.fetch_status = result.status;
+    art.retry_count = result.retry_count;
+    art.next_retry_at = result.next_retry_at;
+    art.fetch_error = null;
+    art.has_content = false;
+    art.content_fetched_at = null;
+  }
+  renderArticleList();
+  await loadStats();
+  if (selectedArticleId === id) {
+    selectedArticleId = null;
+    selectArticle(id);
   }
 }
 

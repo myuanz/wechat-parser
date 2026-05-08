@@ -78,10 +78,13 @@ class ArticleContent:
     fetch_error: str | None
     fetched_at: datetime | None
     updated_at: datetime
+    retry_count: int = 0
+    next_retry_at: datetime | None = None
 
     def index(self):
         yield self.article_id
         yield self.status
+        yield self.next_retry_at
         yield self.updated_at
 
     def unique_index(self):
