@@ -52,6 +52,7 @@
    - `POST /api/articles/{article_id}/retry-fetch`
    - 设置 `status = "pending"`、`retry_count = 0`、`next_retry_at = now`、清空错误和已抓取时间
    - 下一轮 collector 自动抓取
+8. `ArticleContent` 是唯一正文抓取队列，collector 只从数据库状态消费待抓任务，不单独维护内存投递队列。
 
 ## 微信采集原理
 
@@ -70,10 +71,11 @@
 7. `ItemXml` 通过 `biz + mid + idx` 作为文章唯一键，保存时对应 `Article.key = f"{biz}:{mid}:{idx}"`。
 8. 每轮 collector 的流程：
    - 启动时先扫描一次内存，保存当前可见文章。
+   - 从数据库队列消费待抓正文任务。
    - 截图识别订阅号列表里的未读红点。
    - 依次移动鼠标并点击红点，等待 `--wait-after-click` 后再次扫描内存。
-   - 新文章入库后提交后台正文抓取。
-9. 已存在文章再次扫描到时只更新元数据和 `last_seen_at` / `seen_count`，不要在这里绕过重试模型强行抓正文。
+   - 每次保存扫描结果后，再从数据库队列消费待抓正文任务。
+9. 已存在文章再次扫描到时只更新元数据和 `last_seen_at` / `seen_count`，正文抓取统一交给数据库队列消费，不要绕过重试模型单篇直投。
 
 ## xpra / X11 控制
 
@@ -111,7 +113,7 @@
    - 默认 `DEFAULT_FETCH_DELAY = 3.0`
    - 实际每次请求间隔随机在 `fetch_delay` 到 `fetch_delay * 2`
    - 通过 `/tmp/wechat_article_fetch.lock` 和 `/tmp/wechat_article_fetch.last` 跨线程/进程协调。
-7. collector 固定只开一个后台线程抓取正文。
+7. collector 固定只开一个后台线程抓取正文，并通过 `fetch_pending_article_contents()` 消费数据库队列。
 
 ## 前端与 API
 

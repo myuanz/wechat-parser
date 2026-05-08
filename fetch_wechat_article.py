@@ -273,7 +273,9 @@ class ArticleFetcher:
             article = client.article.find_first(where={"id": article_id})
             if article is None:
                 raise ValueError(f"文章不存在: article_id={article_id}")
+            print(f"文章内容抓取开始: article_id={article.id} title={article.title}", flush=True)
             self.fetch_and_save_article_content(client, article.id, article.url)
+            print(f"文章内容抓取成功: article_id={article.id} title={article.title}", flush=True)
         finally:
             Client.close_all()
 
@@ -292,11 +294,12 @@ class ArticleFetcher:
                 if not should_fetch_article(article):
                     continue
 
-                print(f"抓取文章: article_id={article.id} title={article.title}")
+                print(f"抓取文章: article_id={article.id} title={article.title}", flush=True)
                 try:
                     self.fetch_and_save_article_content(client, article.id, article.url)
+                    print(f"抓取成功: article_id={article.id} title={article.title}", flush=True)
                 except Exception as error:
-                    print(f"抓取失败: article_id={article.id} error={error}", file=sys.stderr)
+                    print(f"抓取失败: article_id={article.id} error={error}", file=sys.stderr, flush=True)
                 fetched += 1
         finally:
             Client.close_all()

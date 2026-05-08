@@ -6,7 +6,7 @@ import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
-from typing import Callable, Literal, NamedTuple
+from typing import Literal, NamedTuple
 
 import cv2
 import numpy as np
@@ -110,7 +110,6 @@ def save_articles(
     result: ScanResult,
     reason: str,
     print_scanned: bool,
-    on_new_article: Callable[[int], None] | None = None,
 ) -> None:
     observed_at = datetime.now(UTC)
 
@@ -139,7 +138,7 @@ def save_articles(
         existing = client.article.find_first(where={"key": key})
         if existing is None:
             new_rows.append(row)
-            article = client.article.insert(
+            client.article.insert(
                 {
                     "key": key,
                     "account_id": account.id,
@@ -157,8 +156,6 @@ def save_articles(
                     "seen_count": 1,
                 }
             )
-            if on_new_article is not None:
-                on_new_article(article.id)
         else:
             client.article.update(
                 where={"id": existing.id},
@@ -216,15 +213,15 @@ def capture_unread_points() -> list[tuple[int, int]]:
     return points
 
 
-def log_fetch_error(future: Future[None]) -> None:
+def log_fetch_queue_error(future: Future[None]) -> None:
     error = future.exception()
     if error is not None:
-        print(f"文章内容抓取失败: {error}", file=sys.stderr)
+        print(f"文章内容队列消费失败: {error}", file=sys.stderr, flush=True)
 
 
-def submit_article_fetch(executor: ThreadPoolExecutor, fetcher: ArticleFetcher, article_id: int) -> None:
-    future = executor.submit(fetcher.fetch_article_content_by_id, article_id)
-    future.add_done_callback(log_fetch_error)
+def submit_pending_article_fetch(executor: ThreadPoolExecutor, fetcher: ArticleFetcher) -> None:
+    future = executor.submit(fetcher.fetch_pending_article_contents)
+    future.add_done_callback(log_fetch_queue_error)
 
 
 def collect_once(
@@ -237,9 +234,9 @@ def collect_once(
     print_all: bool,
     fetcher: ArticleFetcher,
 ) -> None:
-    on_new_article = lambda article_id: submit_article_fetch(executor, fetcher, article_id)
     result = scan_articles(scanner=scanner, all_regions=all_regions)
-    save_articles(client, result, "启动扫描", print_scanned=print_all, on_new_article=on_new_article)
+    save_articles(client, result, "启动扫描", print_scanned=print_all)
+    submit_pending_article_fetch(executor, fetcher)
 
     clicked = 0
     while clicked < max_clicks:
@@ -272,8 +269,8 @@ def collect_once(
             result,
             f"点击红点 {clicked + 1} 后",
             print_scanned=False,
-            on_new_article=on_new_article,
         )
+        submit_pending_article_fetch(executor, fetcher)
         clicked += 1
 
     print(f"达到最大点击次数 max_clicks={max_clicks}，停止本轮")
