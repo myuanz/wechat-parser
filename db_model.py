@@ -1,10 +1,14 @@
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+
+
+DB_PATH = Path(__file__).with_name("wechat_articles.db").resolve()
 
 
 __datasource__ = {
     "provider": "sqlite",
-    "url": "sqlite:///wechat_articles.db",
+    "url": f"sqlite:///{DB_PATH}",
 }
 
 

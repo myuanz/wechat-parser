@@ -8,13 +8,13 @@ from dclassql import Client
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
-from db_model import Article
+from db_model import Article, DB_PATH
 
 app = FastAPI(title="wechat-parser")
 
 
 def _db():
-    return sqlite3.connect("wechat_articles.db")
+    return sqlite3.connect(DB_PATH, timeout=30)
 
 
 def _decompress(html_zstd: bytes | None) -> str | None:
