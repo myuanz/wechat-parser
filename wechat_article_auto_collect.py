@@ -6,6 +6,7 @@ import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
+from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
 import cv2
@@ -17,7 +18,7 @@ from fetch_wechat_article import DEFAULT_FETCH_DELAY, ArticleFetcher
 from wechat_mem_item_xml_scan import ItemXml, dedupe
 from wechat_mem_item_xml_scan import scan_pid as scan_pid_matcher
 from wechat_mem_xml_parse_scan import scan_pid as scan_pid_parser
-from x11_wechat import capture_wechat_png, click_wechat, move_wechat_mouse
+from x11_wechat import Rect, capture_wechat_png, click_wechat
 
 
 Stage = Literal["init", "flow", "tab"]
@@ -53,23 +54,182 @@ class WechatUi:
             return None
         return self.raw_img[:, self.split_line_idxs[1] : self.split_line_idxs[2]]
 
-    def find_unread_subs(self) -> list[tuple[int, int]]:
+    def find_unread_subs(self) -> list["UnreadSubTarget"]:
         account_list_img = self.account_list_img()
         if account_list_img is None:
             return []
 
-        mask = (account_list_img == np.array([250, 81, 81, 255])).all(axis=2)
+        rgb = account_list_img[..., :3].astype(np.int16)
+        red = np.array([250, 81, 81], dtype=np.int16)
+        color_diff = np.abs(rgb - red).max(axis=2)
+        alpha_ok = self.raw_img[:, self.split_line_idxs[1] : self.split_line_idxs[2], 3] >= 240
+        mask = (color_diff <= 12) & alpha_ok
         _, binary = cv2.threshold(mask.astype(np.uint8) * 255, 10, 255, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        subs: list[tuple[int, int]] = []
+        subs: list[UnreadSubTarget] = []
+        account_list_x = self.split_line_idxs[1]
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
             mini = account_list_img[y : y + h, x : x + w]
             score = mini[..., :3].std(2).mean() * 3
-            if score > 200:
-                subs.append((x + self.split_line_idxs[1], y))
-        return sorted(subs, key=lambda item: (item[1], item[0]))
+            area = w * h
+            strict_pixels = int(mask[y : y + h, x : x + w].sum())
+            is_small_exact_badge = w <= 8 and h <= 8 and strict_pixels >= 8
+            if area < 8 or (score <= 200 and not is_small_exact_badge):
+                continue
+
+            badge_center_x = x + w // 2 + account_list_x
+            badge_center_y = y + h // 2
+            click_x = account_list_x + min(max(48, x - 24), account_list_img.shape[1] - 24)
+            click_y = y + h // 2
+            subs.append(
+                UnreadSubTarget(
+                    badge_x=badge_center_x,
+                    badge_y=badge_center_y,
+                    click_x=click_x,
+                    click_y=click_y,
+                    width=w,
+                    height=h,
+                )
+            )
+        return sorted(subs, key=lambda item: (item.click_y, item.click_x))
+
+    def debug_unread_candidates(self) -> list["UnreadCandidateDebug"]:
+        account_list_img = self.account_list_img()
+        if account_list_img is None:
+            return []
+
+        account_list_x = self.split_line_idxs[1]
+        rgb = account_list_img[..., :3].astype(np.int16)
+        alpha = self.raw_img[:, self.split_line_idxs[1] : self.split_line_idxs[2], 3]
+        red = np.array([250, 81, 81], dtype=np.int16)
+        color_diff = np.abs(rgb - red).max(axis=2)
+        alpha_ok = alpha >= 240
+        strict_mask = (color_diff <= 12) & alpha_ok
+
+        r = rgb[..., 0]
+        g = rgb[..., 1]
+        b = rgb[..., 2]
+        relaxed_mask = (r >= 160) & (r - g >= 40) & (r - b >= 40) & alpha_ok
+        _, binary = cv2.threshold(relaxed_mask.astype(np.uint8) * 255, 10, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        rows: list[UnreadCandidateDebug] = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            mini = account_list_img[y : y + h, x : x + w]
+            mini_rgb = mini[..., :3].astype(np.int16)
+            mini_alpha = mini[..., 3]
+            mini_diff = color_diff[y : y + h, x : x + w]
+            mini_strict = strict_mask[y : y + h, x : x + w]
+            score = float(mini[..., :3].std(2).mean() * 3)
+            area = w * h
+            strict_pixels = int(mini_strict.sum())
+            alpha_min = int(mini_alpha.min())
+            alpha_max = int(mini_alpha.max())
+            center_rgb = tuple(int(v) for v in account_list_img[y + h // 2, x + w // 2, :3])
+            mean_rgb = tuple(float(v) for v in mini_rgb.reshape(-1, 3).mean(axis=0))
+            min_rgb = tuple(int(v) for v in mini_rgb.reshape(-1, 3).min(axis=0))
+            max_rgb = tuple(int(v) for v in mini_rgb.reshape(-1, 3).max(axis=0))
+
+            reasons: list[str] = []
+            is_small_exact_badge = w <= 8 and h <= 8 and strict_pixels >= 8
+            if strict_pixels == 0:
+                reasons.append("color_diff<=12")
+            if area < 8:
+                reasons.append("area>=8")
+            if score <= 200 and not is_small_exact_badge:
+                reasons.append("score>200")
+            if alpha_min < 240:
+                reasons.append("alpha>=240")
+
+            sample_points: list[PixelSample] = []
+            local_points = np.argwhere(relaxed_mask[y : y + h, x : x + w])
+            for local_y, local_x in local_points[:12]:
+                px = x + int(local_x)
+                py = y + int(local_y)
+                sample_points.append(
+                    PixelSample(
+                        x=px + account_list_x,
+                        y=py,
+                        rgb=tuple(int(v) for v in account_list_img[py, px, :3]),
+                        alpha=int(alpha[py, px]),
+                        color_diff=int(color_diff[py, px]),
+                    )
+                )
+
+            rows.append(
+                UnreadCandidateDebug(
+                    x=x + account_list_x,
+                    y=y,
+                    width=w,
+                    height=h,
+                    area=area,
+                    score=score,
+                    strict_pixels=strict_pixels,
+                    relaxed_pixels=int(relaxed_mask[y : y + h, x : x + w].sum()),
+                    color_diff_min=int(mini_diff.min()),
+                    color_diff_mean=float(mini_diff.mean()),
+                    color_diff_max=int(mini_diff.max()),
+                    alpha_min=alpha_min,
+                    alpha_max=alpha_max,
+                    center_rgb=center_rgb,
+                    mean_rgb=mean_rgb,
+                    min_rgb=min_rgb,
+                    max_rgb=max_rgb,
+                    failed_rules=reasons,
+                    samples=sample_points,
+                )
+            )
+        return sorted(rows, key=lambda item: (item.y, item.x))
+
+
+@dataclass
+class CaptureState:
+    account_list_region: Rect | None = None
+
+
+@dataclass(frozen=True)
+class UnreadSubTarget:
+    badge_x: int
+    badge_y: int
+    click_x: int
+    click_y: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class PixelSample:
+    x: int
+    y: int
+    rgb: tuple[int, int, int]
+    alpha: int
+    color_diff: int
+
+
+@dataclass(frozen=True)
+class UnreadCandidateDebug:
+    x: int
+    y: int
+    width: int
+    height: int
+    area: int
+    score: float
+    strict_pixels: int
+    relaxed_pixels: int
+    color_diff_min: int
+    color_diff_mean: float
+    color_diff_max: int
+    alpha_min: int
+    alpha_max: int
+    center_rgb: tuple[int, int, int]
+    mean_rgb: tuple[float, float, float]
+    min_rgb: tuple[int, int, int]
+    max_rgb: tuple[int, int, int]
+    failed_rules: list[str]
+    samples: list[PixelSample]
 
 
 class ScanResult(NamedTuple):
@@ -204,13 +364,92 @@ def save_click(
     print(f"点击记录: order={order_index} pos=({x}, {y})")
 
 
-def capture_unread_points() -> list[tuple[int, int]]:
-    image = capture_wechat_png()
+def _find_unread_targets_in_account_list(account_list_img: np.ndarray, account_list_x: int) -> list[UnreadSubTarget]:
+    raw_img = to_ch4(account_list_img)
+    rgb = raw_img[..., :3].astype(np.int16)
+    red = np.array([250, 81, 81], dtype=np.int16)
+    color_diff = np.abs(rgb - red).max(axis=2)
+    alpha_ok = raw_img[..., 3] >= 240
+    mask = (color_diff <= 12) & alpha_ok
+    _, binary = cv2.threshold(mask.astype(np.uint8) * 255, 10, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    subs: list[UnreadSubTarget] = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        mini = raw_img[y : y + h, x : x + w]
+        score = mini[..., :3].std(2).mean() * 3
+        area = w * h
+        strict_pixels = int(mask[y : y + h, x : x + w].sum())
+        is_small_exact_badge = w <= 8 and h <= 8 and strict_pixels >= 8
+        if area < 8 or (score <= 200 and not is_small_exact_badge):
+            continue
+
+        badge_center_x = x + w // 2 + account_list_x
+        badge_center_y = y + h // 2
+        click_x = account_list_x + min(max(48, x - 24), raw_img.shape[1] - 24)
+        click_y = y + h // 2
+        subs.append(
+            UnreadSubTarget(
+                badge_x=badge_center_x,
+                badge_y=badge_center_y,
+                click_x=click_x,
+                click_y=click_y,
+                width=w,
+                height=h,
+            )
+        )
+    return sorted(subs, key=lambda item: (item.click_y, item.click_x))
+
+
+def capture_unread_points(state: CaptureState) -> list[UnreadSubTarget]:
+    if state.account_list_region is not None:
+        try:
+            account_list_img = capture_wechat_png(region=state.account_list_region)
+        except RuntimeError:
+            state.account_list_region = None
+        else:
+            targets = _find_unread_targets_in_account_list(account_list_img, state.account_list_region[0])
+            summary = [
+                {
+                    "badge": (target.badge_x, target.badge_y),
+                    "click": (target.click_x, target.click_y),
+                    "size": (target.width, target.height),
+                }
+                for target in targets
+            ]
+            print(
+                f"界面检查: mode=roi region={state.account_list_region} "
+                f"unread={len(targets)} targets={summary}"
+            )
+            return targets
+
+    image = capture_wechat_png(use_cache=True)
     ui = WechatUi(image)
     ui.find_split_line()
-    points = ui.find_unread_subs()
-    print(f"界面检查: split_lines={ui.split_line_idxs} unread={len(points)} points={points}")
-    return points
+    account_list_img = ui.account_list_img()
+    if account_list_img is None or len(ui.split_line_idxs) < 3:
+        state.account_list_region = None
+        print(f"界面检查: split_lines={ui.split_line_idxs} unread=0 targets=[]")
+        return []
+
+    left = ui.split_line_idxs[1]
+    right = ui.split_line_idxs[2]
+    state.account_list_region = (left, 0, right - left, image.shape[0])
+    targets = _find_unread_targets_in_account_list(account_list_img, left)
+    summary = [
+        {
+            "badge": (target.badge_x, target.badge_y),
+            "click": (target.click_x, target.click_y),
+            "size": (target.width, target.height),
+        }
+        for target in targets
+    ]
+    print(
+        f"界面检查: mode=full split_lines={ui.split_line_idxs} region={state.account_list_region} "
+        f"unread={len(targets)} targets={summary}"
+    )
+    return targets
 
 
 def log_fetch_queue_error(future: Future[None]) -> None:
@@ -239,24 +478,48 @@ def collect_once(
     submit_pending_article_fetch(executor, fetcher)
 
     clicked = 0
+    attempted_badges: set[tuple[int, int]] = set()
+    capture_state = CaptureState()
     while clicked < max_clicks:
-        unread_points = capture_unread_points()
-        if not unread_points:
+        try:
+            unread_targets = capture_unread_points(capture_state)
+        except RuntimeError as exc:
+            print(f"界面检查失败，结束本轮: {exc}")
+            return
+        if not unread_targets:
             print("没有未读红点，本轮结束")
             return
 
-        x, y = unread_points[0]
-        click_x = x + 10
-        click_y = y + 10
-        print(f"处理红点: index={clicked + 1} move=({click_x}, {click_y}) click=left")
-        move_wechat_mouse(click_x, click_y)
-        click_wechat(click_x, click_y)
+        target = next(
+            (
+                item
+                for item in unread_targets
+                if (item.badge_x, item.badge_y) not in attempted_badges
+            ),
+            None,
+        )
+        if target is None:
+            print(f"当前可见红点都已尝试过，本轮结束 unread={len(unread_targets)}")
+            return
+
+        attempted_badges.add((target.badge_x, target.badge_y))
+        click_x = target.click_x
+        click_y = target.click_y
+        print(
+            f"处理红点: index={clicked + 1} badge=({target.badge_x}, {target.badge_y}) "
+            f"move=({click_x}, {click_y}) click=left"
+        )
+        try:
+            click_wechat(click_x, click_y)
+        except RuntimeError as exc:
+            print(f"点击失败，结束本轮: {exc}")
+            return
         save_click(
             client,
             x=click_x,
             y=click_y,
             wait_after_click=wait_after_click,
-            unread_count_before=len(unread_points),
+            unread_count_before=len(unread_targets),
             order_index=clicked + 1,
         )
 

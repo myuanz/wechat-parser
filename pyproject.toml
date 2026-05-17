@@ -11,6 +11,7 @@ dependencies = [
     "html-to-markdown>=3.3.2",
     "lxml>=6.1.0",
     "matplotlib>=3.10.9",
+    "mss>=10.2.0",
     "opencv-python>=4.13.0.92",
     "uvicorn>=0.46.0",
 ]

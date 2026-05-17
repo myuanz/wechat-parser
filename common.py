@@ -1,7 +1,12 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
+
+
+WECHAT_MAIN_MARKERS = (
+    "/usr/bin/wechat",
+    "/opt/wechat/wechat",
+    "/.local/wechat-pkg/opt/wechat/wechat",
+)
 
 
 @dataclass
@@ -27,7 +32,7 @@ def role_from_cmdline(pid: int) -> str:
         return "renderer"
     if "WeChatAppEx" in cmdline and "--type=" not in cmdline:
         return "web-shell-browser"
-    if cmdline.endswith("/usr/bin/wechat") or cmdline == "/usr/bin/wechat" or cmdline.endswith("/opt/wechat/wechat") or cmdline == "/opt/wechat/wechat":
+    if any(cmdline.endswith(marker) or cmdline == marker for marker in WECHAT_MAIN_MARKERS):
         return "wechat-main"
     return "other"
 
@@ -41,7 +46,7 @@ def discover_wechat_pids() -> list[int]:
             cmdline = read_cmdline(int(proc.name))
         except OSError:
             continue
-        if "/usr/bin/wechat" in cmdline or "/opt/wechat/wechat" in cmdline or "WeChatAppEx" in cmdline:
+        if any(marker in cmdline for marker in WECHAT_MAIN_MARKERS) or "WeChatAppEx" in cmdline:
             if "crashpad_handler" not in cmdline and "--type=zygote" not in cmdline:
                 pids.append(int(proc.name))
     return sorted(pids)
