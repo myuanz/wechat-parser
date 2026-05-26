@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -74,6 +75,11 @@ DEFAULT_DBUS_SESSION_BUS_ADDRESS = (
     or _WECHAT_SESSION_ENV.get("DBUS_SESSION_BUS_ADDRESS")
     or ""
 )
+DEFAULT_XDG_RUNTIME_DIR = (
+    os.environ.get("XDG_RUNTIME_DIR")
+    or _WECHAT_SESSION_ENV.get("XDG_RUNTIME_DIR")
+    or f"/run/user/{os.getuid()}"
+)
 
 
 def _run(
@@ -105,6 +111,7 @@ def _x11_env(display: str, xauthority: str) -> dict[str, str]:
 
 def _wayland_env() -> dict[str, str]:
     env = os.environ.copy()
+    env["XDG_RUNTIME_DIR"] = DEFAULT_XDG_RUNTIME_DIR
     if DEFAULT_WAYLAND_DISPLAY:
         env["WAYLAND_DISPLAY"] = DEFAULT_WAYLAND_DISPLAY
     if DEFAULT_DBUS_SESSION_BUS_ADDRESS:
@@ -119,6 +126,41 @@ def _wayland_env() -> dict[str, str]:
 def _command_exists(command: str) -> bool:
     result = subprocess.run(["which", command], capture_output=True, text=True)
     return result.returncode == 0
+
+
+def _window_absolute_point(window: X11Window, x: int, y: int) -> tuple[int, int]:
+    if window.client_geometry is None:
+        raise RuntimeError("Wayland 点击缺少窗口几何信息")
+    left, top, _, _ = window.client_geometry
+    return left + x, top + y
+
+
+def _click_with_wdotool(window: X11Window, x: int, y: int, button: int) -> None:
+    abs_x, abs_y = _window_absolute_point(window, x, y)
+    env = _wayland_env()
+    _run(["wdotool", "--backend", "libei", "mousemove", str(abs_x), str(abs_y)], env=env, timeout=5)
+    _run(["wdotool", "--backend", "libei", "click", str(button)], env=env, timeout=5)
+
+
+def _move_with_wdotool(window: X11Window, x: int, y: int) -> None:
+    abs_x, abs_y = _window_absolute_point(window, x, y)
+    _run(
+        ["wdotool", "--backend", "libei", "mousemove", str(abs_x), str(abs_y)],
+        env=_wayland_env(),
+        timeout=5,
+    )
+
+
+def _activate_with_wdotool(window: X11Window) -> None:
+    env = _wayland_env()
+    result = _run(["wdotool", "search", "--name", window.title], env=env, timeout=5)
+    for line in result.stdout.splitlines():
+        window_id = line.split("\t", 1)[0].strip()
+        if window_id:
+            _run(["wdotool", "windowactivate", window_id], env=env, timeout=5)
+            time.sleep(0.2)
+            return
+    raise RuntimeError(f"wdotool 未找到窗口: {window.title}")
 
 
 def _has_xwd_pipeline() -> bool:
@@ -553,21 +595,22 @@ def click_window(
     display: str = DEFAULT_X_DISPLAY,
     xauthority: str = DEFAULT_XAUTHORITY,
 ) -> None:
+    if _has_wayland_session() and _command_exists("wdotool"):
+        _activate_with_wdotool(window)
+        _click_with_wdotool(window, x, y, button)
+        return
+
     env = _x11_env(display, xauthority)
     if _command_exists("xdotool"):
         _run(["xdotool", "mousemove", "--window", window.xid, str(x), str(y), "click", str(button)], env=env)
         return
     if _command_exists("ydotool"):
-        if window.client_geometry is None:
-            raise RuntimeError("Wayland 点击缺少窗口几何信息")
-        left, top, _, _ = window.client_geometry
-        abs_x = left + x
-        abs_y = top + y
+        abs_x, abs_y = _window_absolute_point(window, x, y)
         button_code = {1: "0xC0", 2: "0xC1", 3: "0xC2"}.get(button, str(button))
         _run(["ydotool", "mousemove", "--delay", "0", str(abs_x), str(abs_y)], timeout=3)
         _run(["ydotool", "click", button_code], timeout=3)
         return
-    raise RuntimeError("没有可用的点击工具。请安装 xdotool（XWayland）或 ydotool（Wayland）")
+    raise RuntimeError("没有可用的点击工具。请安装 wdotool（Wayland）、xdotool（XWayland）或 ydotool")
 
 
 def move_window_mouse(
@@ -577,19 +620,19 @@ def move_window_mouse(
     display: str = DEFAULT_X_DISPLAY,
     xauthority: str = DEFAULT_XAUTHORITY,
 ) -> None:
+    if _has_wayland_session() and _command_exists("wdotool"):
+        _move_with_wdotool(window, x, y)
+        return
+
     env = _x11_env(display, xauthority)
     if _command_exists("xdotool"):
         _run(["xdotool", "mousemove", "--window", window.xid, str(x), str(y)], env=env)
         return
     if _command_exists("ydotool"):
-        if window.client_geometry is None:
-            raise RuntimeError("Wayland 移动鼠标缺少窗口几何信息")
-        left, top, _, _ = window.client_geometry
-        abs_x = left + x
-        abs_y = top + y
+        abs_x, abs_y = _window_absolute_point(window, x, y)
         _run(["ydotool", "mousemove", "--delay", "0", str(abs_x), str(abs_y)], timeout=3)
         return
-    raise RuntimeError("没有可用的鼠标移动工具。请安装 xdotool（XWayland）或 ydotool（Wayland）")
+    raise RuntimeError("没有可用的鼠标移动工具。请安装 wdotool（Wayland）、xdotool（XWayland）或 ydotool")
 
 
 def click_wechat(
