@@ -142,6 +142,14 @@ function normalizeZhihuContentHtml(html) {
   });
 
   root.querySelectorAll('noscript').forEach((node) => {
+    const parent = node.parentElement;
+    const siblingImg = parent
+      ? Array.from(parent.querySelectorAll('img')).find((img) => !node.contains(img))
+      : null;
+    if (siblingImg) {
+      node.remove();
+      return;
+    }
     const wrapper = document.createElement('div');
     wrapper.innerHTML = node.textContent || '';
     const img = wrapper.querySelector('img');
