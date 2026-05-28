@@ -20,6 +20,7 @@ DAY_END_HOUR = 23
 AUTO_CHECK_INTERVAL = timedelta(hours=4)
 DEFAULT_TODAY_OUTPUT_DIR = Path(__file__).with_name("dumps") / "zhihu_today"
 DEFAULT_AUTO_STATE_PATH = Path(__file__).with_name("dumps") / "zhihu_auto_check_state.json"
+UV_BIN = Path("/home/lin/.local/bin/uv")
 
 
 def now_local() -> datetime:
@@ -45,7 +46,7 @@ def today_output_path(profile_url: str) -> Path:
 def run_today_updates(profile_url: str) -> dict[str, object]:
     output_path = today_output_path(profile_url)
     cmd = [
-        "uv",
+        str(UV_BIN),
         "run",
         "python",
         str(Path(__file__).with_name("zhihu_profile_today_updates.py")),
