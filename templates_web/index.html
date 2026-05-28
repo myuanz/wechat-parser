@@ -113,6 +113,7 @@ let zhihuCurrentSlug = null;
 let zhihuSelectedFollowingIdx = null;
 let zhihuSelectedItemIdx = null;
 let zhihuTodayRequestSeq = 0;
+let zhihuRefreshInFlight = false;
 
 function h(s) {
   if (!s) return '';
@@ -285,6 +286,11 @@ async function loadZhihuFollowings() {
     : '<div class="loading">暂无关注</div>';
 }
 
+function currentZhihuProfileUrl() {
+  const current = zhihuFollowings.find((item) => item.slug === zhihuCurrentSlug);
+  return current ? (current.profile_url || '') : '';
+}
+
 function selectZhihuFollowing(idx) {
   if (currentView !== 'zhihu') return;
   const item = zhihuFollowings[idx];
@@ -293,7 +299,7 @@ function selectZhihuFollowing(idx) {
   zhihuSelectedItemIdx = null;
   zhihuCurrentSlug = item.slug;
   $$('.acct-item').forEach(el => el.classList.toggle('active', +el.dataset.zhIdx === idx));
-  $('#center-title').innerHTML = `${h(item.name)} <span class="summary-actions"><button type="button" onclick="refreshZhihuToday()">抓今日更新</button></span>`;
+  $('#center-title').innerHTML = `${h(item.name)} <span class="summary-actions"><button id="zhihu-refresh-today-btn" type="button" onclick="refreshZhihuToday()">抓今日更新</button></span>`;
   $('#article-list').innerHTML = '<div class="loading">加载中...</div>';
   $('#article-view').innerHTML = '<div class="article-empty">抓取中...</div>';
   loadZhihuToday();
@@ -323,27 +329,37 @@ function selectZhihuItem(idx) {
 }
 
 async function refreshZhihuToday() {
-  if (!zhihuCurrentSlug) return;
+  if (!zhihuCurrentSlug || zhihuRefreshInFlight) return;
   const requestedSlug = zhihuCurrentSlug;
+  const requestedProfileUrl = currentZhihuProfileUrl();
+  zhihuRefreshInFlight = true;
+  const refreshBtn = $('#zhihu-refresh-today-btn');
+  if (refreshBtn) refreshBtn.disabled = true;
   $('#article-list').innerHTML = '<div class="loading">抓取中...</div>';
   $('#article-view').innerHTML = '<div class="article-empty">抓取中...</div>';
-  const beforeResp = await fetch(`/api/zhihu/following-contents?slug=${encodeURIComponent(requestedSlug)}`);
-  const beforeData = await beforeResp.json();
-  const beforeFetchedAt = beforeData.fetched_at || '';
-  const resp = await fetch(`/api/zhihu/following-refresh?slug=${encodeURIComponent(requestedSlug)}`, { method: 'POST' });
-  const data = await resp.json();
-  console.log('zhihu today refreshed', data);
-  for (let i = 0; i < 20; i += 1) {
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    if (requestedSlug !== zhihuCurrentSlug) return;
-    const pollResp = await fetch(`/api/zhihu/following-contents?slug=${encodeURIComponent(requestedSlug)}`);
-    const pollData = await pollResp.json();
-    if ((pollData.fetched_at || '') !== beforeFetchedAt) {
-      break;
+  try {
+    const resp = await fetch(`/api/zhihu/following-refresh?slug=${encodeURIComponent(requestedSlug)}`, { method: 'POST' });
+    const data = await resp.json();
+    console.log('zhihu today refreshed', data);
+    for (let i = 0; i < 35; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      if (requestedSlug !== zhihuCurrentSlug) return;
+      const pollResp = await fetch('/api/zhihu/sync-status');
+      const pollData = await pollResp.json();
+      if (
+        pollData.action === 'refresh-profile' &&
+        pollData.profile_url === requestedProfileUrl &&
+        pollData.status === 'done'
+      ) {
+        break;
+      }
     }
+    if (requestedSlug !== zhihuCurrentSlug) return;
+    await loadZhihuToday();
+  } finally {
+    zhihuRefreshInFlight = false;
+    if (refreshBtn) refreshBtn.disabled = false;
   }
-  if (requestedSlug !== zhihuCurrentSlug) return;
-  await loadZhihuToday();
 }
 
 async function refreshZhihuFollowing() {
