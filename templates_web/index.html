@@ -3,15 +3,26 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>公众号文章浏览</title>
+<title>news.lan</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; }
-  #app { display: flex; height: 100vh; }
+  .app-shell { display: flex; flex-direction: column; height: 100vh; }
+  .topbar { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid #ddd; background: #fff; }
+  .topbar-title { font-size: 14px; color: #111; font-weight: 600; }
+  .view-switch { display: inline-flex; border: 1px solid #d9d9d9; border-radius: 6px; overflow: hidden; }
+  .view-switch button { min-width: 72px; border: none; background: #fff; padding: 6px 12px; font-size: 13px; color: #666; cursor: pointer; }
+  .view-switch button + button { border-left: 1px solid #d9d9d9; }
+  .view-switch button.active { background: #1a6feb; color: #fff; }
+  #app { display: flex; flex: 1; min-height: 0; }
   .panel { overflow-y: auto; }
   .panel-left { width: 220px; flex-shrink: 0; border-right: 1px solid #ddd; background: #fff; }
   .panel-center { width: 320px; flex-shrink: 0; border-right: 1px solid #ddd; background: #fff; display: flex; flex-direction: column; }
   .panel-right { flex: 1; background: #fff; }
+  .summary-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .summary-actions { display: inline-flex; gap: 8px; margin-left: 8px; vertical-align: middle; }
+  .summary-actions button { border: 1px solid #ddd; background: #fff; padding: 1px 6px; border-radius: 3px; cursor: pointer; font-size: 11px; color: #1a6feb; }
+  .summary-actions button:hover { background: #f0f5ff; border-color: #1a6feb; }
 
   .panel-left h3 { padding: 12px 16px; font-size: 14px; color: #666; border-bottom: 1px solid #eee; }
   .acct-item { padding: 10px 16px; cursor: pointer; border-bottom: 1px solid #f0f0f0; font-size: 14px; transition: background .15s; }
@@ -57,9 +68,17 @@
 </style>
 </head>
 <body>
+<div class="app-shell">
+  <div class="topbar">
+    <div class="topbar-title">news.lan</div>
+    <div class="view-switch">
+      <button id="tab-wechat" class="active" type="button" onclick="switchView('wechat')">公众号</button>
+      <button id="tab-zhihu" type="button" onclick="switchView('zhihu')">知乎</button>
+    </div>
+  </div>
 <div id="app">
   <div class="panel panel-left">
-    <h3>公众号 <a href="/llm.txt" style="font-size:11px;font-weight:normal;color:#1a6feb;float:right">llm.txt</a></h3>
+    <h3 id="left-title">公众号 <a href="/llm.txt" style="font-size:11px;font-weight:normal;color:#1a6feb;float:right">llm.txt</a></h3>
     <div id="stats-bar" style="padding:6px 16px;font-size:11px;color:#999;border-bottom:1px solid #eee;line-height:1.6">加载中...</div>
     <div id="account-list"><div class="loading">加载中...</div></div>
   </div>
@@ -77,15 +96,23 @@
     </div>
   </div>
 </div>
+</div>
 
 <script>
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 
 const PAGE_SIZE = 30;
+let currentView = 'wechat';
 let accounts = [], loadedArticles = [], selectedAccountId = null, selectedArticleId = null,
     currentPage = 0, totalArticles = 0;
 const articleCache = new Map();
+let zhihuFollowings = [];
+let zhihuTodayItems = [];
+let zhihuCurrentSlug = null;
+let zhihuSelectedFollowingIdx = null;
+let zhihuSelectedItemIdx = null;
+let zhihuTodayRequestSeq = 0;
 
 function h(s) {
   if (!s) return '';
@@ -99,6 +126,51 @@ function hAttr(s) {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function normalizeZhihuContentHtml(html) {
+  if (!html) return '';
+  const root = document.createElement('div');
+  root.innerHTML = html;
+
+  root.querySelectorAll('img').forEach((img) => {
+    const actualSrc = img.getAttribute('data-actualsrc') || img.getAttribute('data-original') || img.getAttribute('src');
+    if (actualSrc) img.setAttribute('src', actualSrc);
+    img.removeAttribute('srcset');
+    img.style.maxWidth = '100%';
+    img.style.height = 'auto';
+    img.style.display = 'block';
+    img.style.margin = '12px auto';
+  });
+
+  root.querySelectorAll('noscript').forEach((node) => {
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = node.textContent || '';
+    const img = wrapper.querySelector('img');
+    if (!img) {
+      node.remove();
+      return;
+    }
+    const actualSrc = img.getAttribute('data-original') || img.getAttribute('src');
+    if (actualSrc) img.setAttribute('src', actualSrc);
+    img.style.maxWidth = '100%';
+    img.style.height = 'auto';
+    img.style.display = 'block';
+    img.style.margin = '12px auto';
+    node.replaceWith(img);
+  });
+
+  root.querySelectorAll('figure').forEach((figure) => {
+    figure.style.margin = '16px 0';
+  });
+
+  root.querySelectorAll('figcaption').forEach((caption) => {
+    caption.style.color = '#666';
+    caption.style.fontSize = '12px';
+    caption.style.marginTop = '6px';
+  });
+
+  return root.innerHTML;
+}
+
 function fmtTime(iso) {
   if (!iso) return '-';
   const d = new Date(iso);
@@ -106,7 +178,182 @@ function fmtTime(iso) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+function switchView(view) {
+  currentView = view;
+  $('#tab-wechat').classList.toggle('active', view === 'wechat');
+  $('#tab-zhihu').classList.toggle('active', view === 'zhihu');
+
+  if (view === 'wechat') {
+    $('#left-title').innerHTML = '公众号 <a href="/llm.txt" style="font-size:11px;font-weight:normal;color:#1a6feb;float:right">llm.txt</a>';
+    $('#stats-bar').textContent = '加载中...';
+    $('#account-list').innerHTML = '<div class="loading">加载中...</div>';
+    $('#center-title').textContent = '文章列表';
+    $('#article-list').innerHTML = '<div class="loading">请选择公众号</div>';
+    $('#article-view').textContent = '选择文章查看内容';
+    loadStats();
+    loadAccounts();
+    return;
+  }
+
+  $('#left-title').innerHTML = '知乎 <a href="/zhihu.txt" style="font-size:11px;font-weight:normal;color:#1a6feb;float:right">zhihu.txt</a>';
+  zhihuCurrentSlug = null;
+  zhihuSelectedFollowingIdx = null;
+  zhihuSelectedItemIdx = null;
+  $('#stats-bar').innerHTML = `
+    共 <strong id="zh-total-following">-</strong> 个知乎关注
+    <span class="summary-actions"><button type="button" onclick="refreshZhihuFollowing()">刷新关注</button></span><br>
+    回答作者 <strong id="zh-answer-authors">-</strong> 个<br>
+    已收录内容 <strong id="zh-total-contents">-</strong> 条<br>
+    今日新增 <strong id="zh-today-new">-</strong> 条
+    <span class="summary-actions"><button type="button" onclick="checkZhihuNew()">检查新内容</button></span><br>
+    <span style="font-size:10px">上次检查 <span id="zh-last-check">-</span></span>`;
+  $('#account-list').innerHTML = '<div class="loading">知乎关注列表稍后接入</div>';
+  $('#center-title').textContent = '知乎今日更新';
+  $('#article-list').innerHTML = '<div class="loading">请选择左侧知乎账号</div>';
+  $('#pager').innerHTML = '';
+  $('#article-url-bar').style.display = 'none';
+  $('#article-view').innerHTML = '<div class="article-empty">请选择左侧知乎账号<br><small>点击后可直接查看今日更新</small></div>';
+  loadZhihuStats();
+}
+
+async function loadZhihuStats() {
+  if (currentView !== 'zhihu') return;
+  const resp = await fetch('/api/zhihu/stats');
+  const s = await resp.json();
+  $('#zh-total-following').textContent = s.total_following;
+  $('#zh-answer-authors').textContent = s.answer_authors;
+  $('#zh-total-contents').textContent = s.total_contents;
+  $('#zh-today-new').textContent = s.today_new;
+  $('#zh-last-check').textContent = fmtTime(s.last_check);
+  await loadZhihuFollowings();
+  await loadZhihuToday();
+}
+
+async function loadZhihuToday() {
+  if (currentView !== 'zhihu') return;
+  if (!zhihuCurrentSlug) {
+    zhihuTodayItems = [];
+    zhihuSelectedItemIdx = null;
+    $('#article-list').innerHTML = '<div class="loading">请选择左侧知乎账号</div>';
+    return;
+  }
+  const requestedSlug = zhihuCurrentSlug;
+  const requestSeq = ++zhihuTodayRequestSeq;
+  const url = `/api/zhihu/following-contents?slug=${encodeURIComponent(requestedSlug)}`;
+  const resp = await fetch(url);
+  const data = await resp.json();
+  if (currentView !== 'zhihu' || requestSeq !== zhihuTodayRequestSeq || requestedSlug !== zhihuCurrentSlug) return;
+  zhihuTodayItems = Array.isArray(data.items) ? data.items : [];
+  if (!zhihuTodayItems[zhihuSelectedItemIdx ?? -1]) zhihuSelectedItemIdx = null;
+  $('#article-list').innerHTML = zhihuTodayItems.length
+    ? zhihuTodayItems.map((item, idx) => `
+      <div class="art-item ${zhihuSelectedItemIdx === idx ? 'active' : ''}" data-zh-idx="${idx}" onclick="selectZhihuItem(${idx})">
+        <div class="art-times">
+          <span>发布 ${fmtTime(item.publish_time_iso)}</span>
+          <span>更新 ${fmtTime(item.updated_time_iso)}</span>
+        </div>
+        <div class="art-title">${h(item.title || '未命名')}</div>
+        <div class="art-meta"><span>${h(item.author_name || '')}</span><span>${h(item.content_type || '')}</span></div>
+      </div>
+    `).join('')
+    : '<div class="loading">今天还没有新增</div>';
+  if (zhihuTodayItems.length) selectZhihuItem(0);
+  else {
+    $('#article-url-bar').style.display = 'none';
+    $('#article-view').innerHTML = '<div class="article-empty">今天还没有新增</div>';
+  }
+}
+
+async function loadZhihuFollowings() {
+  const resp = await fetch('/api/zhihu/following');
+  zhihuFollowings = await resp.json();
+  zhihuSelectedFollowingIdx = zhihuFollowings.findIndex(item => item.slug === zhihuCurrentSlug);
+  $('#account-list').innerHTML = zhihuFollowings.length
+    ? zhihuFollowings.map((item, idx) => `
+      <div class="acct-item ${idx === zhihuSelectedFollowingIdx ? 'active' : ''}" data-zh-idx="${idx}" onclick="selectZhihuFollowing(${idx})">
+        ${h(item.name)}
+      </div>
+    `).join('')
+    : '<div class="loading">暂无关注</div>';
+}
+
+function selectZhihuFollowing(idx) {
+  if (currentView !== 'zhihu') return;
+  const item = zhihuFollowings[idx];
+  if (!item) return;
+  zhihuSelectedFollowingIdx = idx;
+  zhihuSelectedItemIdx = null;
+  zhihuCurrentSlug = item.slug;
+  $$('.acct-item').forEach(el => el.classList.toggle('active', +el.dataset.zhIdx === idx));
+  $('#center-title').innerHTML = `${h(item.name)} <span class="summary-actions"><button type="button" onclick="refreshZhihuToday()">抓今日更新</button></span>`;
+  $('#article-list').innerHTML = '<div class="loading">加载中...</div>';
+  $('#article-view').innerHTML = '<div class="article-empty">抓取中...</div>';
+  loadZhihuToday();
+}
+
+function selectZhihuItem(idx) {
+  if (currentView !== 'zhihu') return;
+  const item = zhihuTodayItems[idx];
+  if (!item) return;
+  zhihuSelectedItemIdx = idx;
+  $$('.art-item').forEach(el => el.classList.toggle('active', +el.dataset.zhIdx === idx));
+  $('#article-url-bar').style.display = 'block';
+  $('#article-url-bar').innerHTML = `<a href="${hAttr(item.url)}" target="_blank" rel="noopener noreferrer">${h(item.url)}</a>`;
+  const title = item.title || '未命名';
+  const publishTime = fmtTime(item.publish_time_iso);
+  const updatedTime = fmtTime(item.updated_time_iso);
+  const contentHtml = normalizeZhihuContentHtml(item.content_html || '');
+  const safeText = h(item.content_text || '');
+  $('#article-view').innerHTML = `
+    <div style="padding:20px;max-width:860px;line-height:1.8;color:#222">
+      <div style="font-size:12px;color:#999;margin-bottom:8px">${h(item.content_type || '')} · ${h(item.author_name || '')}</div>
+      <h2 style="font-size:22px;line-height:1.4;margin-bottom:12px">${h(title)}</h2>
+      <div style="font-size:12px;color:#999;margin-bottom:18px">发布 ${h(publishTime)} · 更新 ${h(updatedTime)}</div>
+      <div style="font-size:15px;line-height:1.9;word-break:break-word">${contentHtml || `<div style="white-space:pre-wrap">${safeText}</div>`}</div>
+    </div>
+  `;
+}
+
+async function refreshZhihuToday() {
+  if (!zhihuCurrentSlug) return;
+  const requestedSlug = zhihuCurrentSlug;
+  $('#article-list').innerHTML = '<div class="loading">抓取中...</div>';
+  $('#article-view').innerHTML = '<div class="article-empty">抓取中...</div>';
+  const beforeResp = await fetch(`/api/zhihu/following-contents?slug=${encodeURIComponent(requestedSlug)}`);
+  const beforeData = await beforeResp.json();
+  const beforeFetchedAt = beforeData.fetched_at || '';
+  const resp = await fetch(`/api/zhihu/following-refresh?slug=${encodeURIComponent(requestedSlug)}`, { method: 'POST' });
+  const data = await resp.json();
+  console.log('zhihu today refreshed', data);
+  for (let i = 0; i < 20; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    if (requestedSlug !== zhihuCurrentSlug) return;
+    const pollResp = await fetch(`/api/zhihu/following-contents?slug=${encodeURIComponent(requestedSlug)}`);
+    const pollData = await pollResp.json();
+    if ((pollData.fetched_at || '') !== beforeFetchedAt) {
+      break;
+    }
+  }
+  if (requestedSlug !== zhihuCurrentSlug) return;
+  await loadZhihuToday();
+}
+
+async function refreshZhihuFollowing() {
+  const resp = await fetch('/api/zhihu/refresh-following', { method: 'POST' });
+  const data = await resp.json();
+  console.log('zhihu refresh queued', data);
+  await loadZhihuStats();
+}
+
+async function checkZhihuNew() {
+  const resp = await fetch('/api/zhihu/check-new', { method: 'POST' });
+  const data = await resp.json();
+  console.log('zhihu check queued', data);
+  await loadZhihuStats();
+}
+
 async function loadAccounts() {
+  if (currentView !== 'wechat') return;
   const resp = await fetch('/api/accounts');
   accounts = await resp.json();
   const el = $('#account-list');
@@ -118,12 +365,14 @@ async function loadAccounts() {
 }
 
 async function loadStats() {
+  if (currentView !== 'wechat') return;
   const resp = await fetch('/api/stats');
   const s = await resp.json();
   $('#stats-bar').innerHTML = `共 ${s.total_accounts} 个公众号<br>${s.total_articles} 篇文章<br>已抓取 ${s.fetched_articles} 篇<br>待抓取 ${s.pending_articles} 篇<br>失败 ${s.failed_articles} 篇<br>已放弃 ${s.give_up_articles} 篇<br><span style="font-size:10px">上次采集 ${fmtTime(s.last_collect_at)}</span>`;
 }
 
 async function selectAccount(id) {
+  if (currentView !== 'wechat') return;
   selectedAccountId = id;
   selectedArticleId = null;
   loadedArticles = [];
@@ -138,6 +387,7 @@ async function selectAccount(id) {
 }
 
 async function loadPage(page) {
+  if (currentView !== 'wechat') return;
   currentPage = page;
   const el = $('#article-list');
   el.innerHTML = '<div class="loading">加载中...</div>';
@@ -207,6 +457,7 @@ function renderPager() {
 }
 
 async function selectArticle(id) {
+  if (currentView !== 'wechat') return;
   if (selectedArticleId === id) return;
   selectedArticleId = id;
   $$('.art-item').forEach(el => el.classList.toggle('active', +el.dataset.id === id));
@@ -237,6 +488,7 @@ async function selectArticle(id) {
 }
 
 async function retryFetch(event, id) {
+  if (currentView !== 'wechat') return;
   event.stopPropagation();
   const btn = event.currentTarget;
   btn.disabled = true;
@@ -265,8 +517,7 @@ async function retryFetch(event, id) {
   }
 }
 
-loadAccounts();
-loadStats();
+switchView('wechat');
 </script>
 </body>
 </html>
