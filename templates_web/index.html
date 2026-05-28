@@ -23,6 +23,7 @@
   .summary-actions { display: inline-flex; gap: 8px; margin-left: 8px; vertical-align: middle; }
   .summary-actions button { border: 1px solid #ddd; background: #fff; padding: 1px 6px; border-radius: 3px; cursor: pointer; font-size: 11px; color: #1a6feb; }
   .summary-actions button:hover { background: #f0f5ff; border-color: #1a6feb; }
+  .summary-status { font-size: 11px; color: #999; margin-left: 8px; }
 
   .panel-left h3 { padding: 12px 16px; font-size: 14px; color: #666; border-bottom: 1px solid #eee; }
   .acct-item { padding: 10px 16px; cursor: pointer; border-bottom: 1px solid #f0f0f0; font-size: 14px; transition: background .15s; }
@@ -266,7 +267,8 @@ async function loadZhihuToday() {
       </div>
     `).join('')
     : '<div class="loading">今天还没有新增</div>';
-  if (zhihuTodayItems.length) selectZhihuItem(0);
+  if (zhihuTodayItems.length && zhihuSelectedItemIdx !== null) selectZhihuItem(zhihuSelectedItemIdx);
+  else if (zhihuTodayItems.length) selectZhihuItem(0);
   else {
     $('#article-url-bar').style.display = 'none';
     $('#article-view').innerHTML = '<div class="article-empty">今天还没有新增</div>';
@@ -291,6 +293,15 @@ function currentZhihuProfileUrl() {
   return current ? (current.profile_url || '') : '';
 }
 
+function setZhihuCenterTitle(name, statusText = '') {
+  $('#center-title').innerHTML = `${h(name)} <span class="summary-actions"><button id="zhihu-refresh-today-btn" type="button" onclick="refreshZhihuToday()">抓今日更新</button></span><span id="zhihu-refresh-status" class="summary-status">${h(statusText)}</span>`;
+}
+
+function setZhihuRefreshStatus(statusText = '') {
+  const statusEl = $('#zhihu-refresh-status');
+  if (statusEl) statusEl.textContent = statusText;
+}
+
 function selectZhihuFollowing(idx) {
   if (currentView !== 'zhihu') return;
   const item = zhihuFollowings[idx];
@@ -299,7 +310,7 @@ function selectZhihuFollowing(idx) {
   zhihuSelectedItemIdx = null;
   zhihuCurrentSlug = item.slug;
   $$('.acct-item').forEach(el => el.classList.toggle('active', +el.dataset.zhIdx === idx));
-  $('#center-title').innerHTML = `${h(item.name)} <span class="summary-actions"><button id="zhihu-refresh-today-btn" type="button" onclick="refreshZhihuToday()">抓今日更新</button></span>`;
+  setZhihuCenterTitle(item.name);
   $('#article-list').innerHTML = '<div class="loading">加载中...</div>';
   $('#article-view').innerHTML = '<div class="article-empty">抓取中...</div>';
   loadZhihuToday();
@@ -331,31 +342,24 @@ function selectZhihuItem(idx) {
 async function refreshZhihuToday() {
   if (!zhihuCurrentSlug || zhihuRefreshInFlight) return;
   const requestedSlug = zhihuCurrentSlug;
-  const requestedProfileUrl = currentZhihuProfileUrl();
   zhihuRefreshInFlight = true;
+  setZhihuRefreshStatus('抓取中...');
   const refreshBtn = $('#zhihu-refresh-today-btn');
   if (refreshBtn) refreshBtn.disabled = true;
-  $('#article-list').innerHTML = '<div class="loading">抓取中...</div>';
-  $('#article-view').innerHTML = '<div class="article-empty">抓取中...</div>';
   try {
     const resp = await fetch(`/api/zhihu/following-refresh?slug=${encodeURIComponent(requestedSlug)}`, { method: 'POST' });
     const data = await resp.json();
-    console.log('zhihu today refreshed', data);
-    for (let i = 0; i < 35; i += 1) {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      if (requestedSlug !== zhihuCurrentSlug) return;
-      const pollResp = await fetch('/api/zhihu/sync-status');
-      const pollData = await pollResp.json();
-      if (
-        pollData.action === 'refresh-profile' &&
-        pollData.profile_url === requestedProfileUrl &&
-        pollData.status === 'done'
-      ) {
-        break;
-      }
+    if (!resp.ok) {
+      throw new Error(data.detail || '抓取失败');
     }
     if (requestedSlug !== zhihuCurrentSlug) return;
     await loadZhihuToday();
+    if (requestedSlug !== zhihuCurrentSlug) return;
+    const itemCount = typeof data.items_count === 'number' ? data.items_count : zhihuTodayItems.length;
+    setZhihuRefreshStatus(itemCount ? `抓到 ${itemCount} 条` : '今日无新增');
+  } catch (error) {
+    if (requestedSlug === zhihuCurrentSlug) setZhihuRefreshStatus('抓取失败');
+    console.error('zhihu today refresh failed', error);
   } finally {
     zhihuRefreshInFlight = false;
     if (refreshBtn) refreshBtn.disabled = false;

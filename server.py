@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from db_model import Article, DB_PATH
 from zhihu_sync import read_sync_result, write_sync_request
+from zhihu_worker import run_today_updates
 
 app = FastAPI(title="wechat-parser")
 DEFAULT_FOLLOWING_SNAPSHOT = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
@@ -650,8 +651,21 @@ def api_zhihu_following_refresh(slug: str = Query(...)):
                 break
     if row is None:
         raise HTTPException(status_code=404, detail="zhihu following not found")
-    payload = write_sync_request("refresh-profile", profile_url=row[0], slug=slug)
-    return {"ok": True, "queued": True, **payload}
+    profile_url = str(row[0])
+    try:
+        result = run_today_updates(profile_url)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+    payload = _read_zhihu_today_output(profile_url)
+    items = payload.get("items")
+    return {
+        "ok": True,
+        "slug": slug,
+        "profile_url": profile_url,
+        "fetched_at": payload.get("fetched_at"),
+        "items_count": len(items) if isinstance(items, list) else 0,
+        "output_path": result.get("output_path"),
+    }
 
 
 @app.post("/api/zhihu/refresh-following")
