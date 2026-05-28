@@ -355,8 +355,8 @@ async function refreshZhihuToday() {
     if (requestedSlug !== zhihuCurrentSlug) return;
     await loadZhihuToday();
     if (requestedSlug !== zhihuCurrentSlug) return;
-    const itemCount = typeof data.items_count === 'number' ? data.items_count : zhihuTodayItems.length;
-    setZhihuRefreshStatus(itemCount ? `抓到 ${itemCount} 条` : '今日无新增');
+    const itemCount = typeof data.new_items_count === 'number' ? data.new_items_count : 0;
+    setZhihuRefreshStatus(itemCount ? `本次新增 ${itemCount} 条` : '无新增');
   } catch (error) {
     if (requestedSlug === zhihuCurrentSlug) setZhihuRefreshStatus('抓取失败');
     console.error('zhihu today refresh failed', error);

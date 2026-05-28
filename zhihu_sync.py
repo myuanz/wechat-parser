@@ -788,6 +788,58 @@ def refresh_following(profile_url: str = DEFAULT_PROFILE_URL, profile_dir: Path 
             subprocess.os.environ["XAUTHORITY"] = previous_xauthority
 
 
+def sync_single_author(
+    author_slug: str,
+    profile_url: str,
+    profile_dir: Path = DEFAULT_PROFILE_DIR,
+    signin_url: str = DEFAULT_SIGNIN_URL,
+    login_wait: int = 300,
+) -> dict[str, int]:
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    previous_display = subprocess.os.environ.get("DISPLAY")
+    previous_xauthority = subprocess.os.environ.get("XAUTHORITY")
+    subprocess.os.environ["DISPLAY"] = DEFAULT_X_DISPLAY
+    subprocess.os.environ["XAUTHORITY"] = DEFAULT_XAUTHORITY
+    context = launch_persistent_context(profile_dir, headless=False, locale="zh-CN", timezone="Asia/Shanghai", humanize=True, viewport={"width": 1280, "height": 900})
+    client = Client()
+    try:
+        page = context.new_page()
+        wait_for_login(page, signin_url, login_wait)
+        author = client.zhihu_author.find_first(where={"slug": author_slug})
+        snapshot_user = next((user for user in load_following_snapshot() if user["slug"] == author_slug), None)
+        now_value = now()
+        if author is None:
+            name = snapshot_user["name"] if snapshot_user is not None else author_slug
+            author = ensure_author_record(client, author_slug, name, now_value)
+        if author is None:
+            raise RuntimeError(f"知乎作者不存在: {author_slug}")
+        update_payload = {
+            "profile_url": profile_url,
+            "is_following": True,
+            "updated_at": now_value,
+        }
+        if snapshot_user is not None:
+            update_payload["name"] = snapshot_user["name"]
+            update_payload["headline"] = snapshot_user["headline"]
+            update_payload["avatar_url"] = snapshot_user["avatar"]
+        client.zhihu_author.update(where={"id": author.id}, data=update_payload)
+        author = client.zhihu_author.find_first(where={"id": author.id})
+        if author is None:
+            raise RuntimeError(f"知乎作者不存在: {author_slug}")
+        return sync_author_contents(client, page, author, first_run=author.last_seen_content_id is None)
+    finally:
+        Client.close_all()
+        context.close()
+        if previous_display is None:
+            subprocess.os.environ.pop("DISPLAY", None)
+        else:
+            subprocess.os.environ["DISPLAY"] = previous_display
+        if previous_xauthority is None:
+            subprocess.os.environ.pop("XAUTHORITY", None)
+        else:
+            subprocess.os.environ["XAUTHORITY"] = previous_xauthority
+
+
 def write_sync_request(action: str, profile_url: str = DEFAULT_REQUEST_PROFILE_URL, **extra: object) -> dict[str, object]:
     DEFAULT_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {

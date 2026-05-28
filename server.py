@@ -13,8 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from db_model import Article, DB_PATH
-from zhihu_sync import read_sync_result, write_sync_request
-from zhihu_worker import run_today_updates
+from zhihu_sync import read_sync_result, sync_single_author, write_sync_request
 
 app = FastAPI(title="wechat-parser")
 DEFAULT_FOLLOWING_SNAPSHOT = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
@@ -122,7 +121,7 @@ def _row_to_zhihu_item(row: tuple[object, ...]) -> dict[str, object]:
     }
 
 
-def _db_zhihu_today_items_by_slug(slug: str) -> list[dict[str, object]]:
+def _db_zhihu_contents_by_slug(slug: str) -> list[dict[str, object]]:
     db = _db()
     try:
         rows = db.execute(
@@ -139,7 +138,6 @@ def _db_zhihu_today_items_by_slug(slug: str) -> list[dict[str, object]]:
             FROM ZhihuAnswer a
             JOIN ZhihuAuthor au ON au.id = a.author_id
             WHERE au.slug = ?
-              AND date(a.first_seen_at) = date('now', 'localtime')
             UNION ALL
             SELECT
                 'pin' AS content_type,
@@ -156,7 +154,6 @@ def _db_zhihu_today_items_by_slug(slug: str) -> list[dict[str, object]]:
             FROM ZhihuPin p
             JOIN ZhihuAuthor au ON au.id = p.author_id
             WHERE au.slug = ?
-              AND date(p.first_seen_at) = date('now', 'localtime')
             ORDER BY publish_time_iso DESC
             """,
             [slug, slug],
@@ -566,20 +563,9 @@ def api_zhihu_following_contents(slug: str = Query(...)):
     if row is None:
         raise HTTPException(status_code=404, detail="zhihu following not found")
 
-    profile_url = row[0]
-    try:
-        payload = _read_zhihu_today_output(profile_url)
-    except HTTPException as error:
-        if error.status_code != 404:
-            raise
-        return {"fetched_at": None, "items": _db_zhihu_today_items_by_slug(slug)}
-    items = payload.get("items")
-    result_items = items if isinstance(items, list) else []
-    if not result_items:
-        result_items = _db_zhihu_today_items_by_slug(slug)
     return {
-        "fetched_at": payload.get("fetched_at"),
-        "items": result_items,
+        "fetched_at": None,
+        "items": _db_zhihu_contents_by_slug(slug),
     }
 
 
@@ -653,18 +639,16 @@ def api_zhihu_following_refresh(slug: str = Query(...)):
         raise HTTPException(status_code=404, detail="zhihu following not found")
     profile_url = str(row[0])
     try:
-        result = run_today_updates(profile_url)
+        result = sync_single_author(slug, profile_url)
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
-    payload = _read_zhihu_today_output(profile_url)
-    items = payload.get("items")
     return {
         "ok": True,
         "slug": slug,
         "profile_url": profile_url,
-        "fetched_at": payload.get("fetched_at"),
-        "items_count": len(items) if isinstance(items, list) else 0,
-        "output_path": result.get("output_path"),
+        "new_items_count": int(result.get("new_answers", 0)) + int(result.get("new_pins", 0)),
+        "new_answers": int(result.get("new_answers", 0)),
+        "new_pins": int(result.get("new_pins", 0)),
     }
 
 
