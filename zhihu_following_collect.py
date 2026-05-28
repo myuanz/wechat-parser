@@ -12,7 +12,7 @@ from cloakbrowser import launch_persistent_context
 DEFAULT_FOLLOWING_URL = "https://www.zhihu.com/people/bu-ye-cheng-76/following"
 DEFAULT_SIGNIN_URL = "https://www.zhihu.com/signin"
 DEFAULT_PROFILE_DIR = Path(__file__).with_name("browser_profiles") / "zhihu"
-DEFAULT_OUTPUT = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
+DEFAULT_OUTPUT = Path("/srv/samba/share") / "zhihu_following_latest.json"
 
 
 def normalize_people_url(href: str) -> str | None:

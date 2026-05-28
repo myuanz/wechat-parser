@@ -1,6 +1,10 @@
+import os
 import sqlite3
+import json
+from datetime import time as dt_time
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import html_to_markdown
 from compression import zstd
@@ -9,8 +13,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from db_model import Article, DB_PATH
+from zhihu_sync import read_sync_result, write_sync_request
 
 app = FastAPI(title="wechat-parser")
+DEFAULT_FOLLOWING_SNAPSHOT = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
+DEFAULT_ZHIHU_TODAY_DIR = Path(__file__).with_name("dumps") / "zhihu_today"
 
 
 def _db():
@@ -25,6 +32,162 @@ def _decompress(html_zstd: bytes | None) -> str | None:
 
 def _normalize_dt(value: str) -> str:
     return datetime.fromisoformat(value).isoformat()
+
+
+def _load_following_snapshot() -> list[dict[str, str]]:
+    if not DEFAULT_FOLLOWING_SNAPSHOT.exists():
+        return []
+    payload = json.loads(DEFAULT_FOLLOWING_SNAPSHOT.read_text(encoding="utf-8"))
+    users = payload.get("users")
+    if not isinstance(users, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in users:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        url = str(item.get("url") or "")
+        slug = str(item.get("slug") or "")
+        headline = str(item.get("headline") or "")
+        avatar = str(item.get("avatar") or "")
+        if not name or not url or not slug:
+            continue
+        result.append(
+            {
+                "slug": slug,
+                "name": name,
+                "profile_url": url,
+                "headline": headline,
+                "avatar_url": avatar,
+            }
+        )
+    return result
+
+
+def _zhihu_profile_slug(profile_url: str) -> str:
+    parts = [part for part in urlparse(profile_url).path.split("/") if part]
+    if len(parts) >= 2 and parts[0] in {"people", "org"}:
+        return parts[1]
+    raise HTTPException(status_code=400, detail=f"invalid zhihu profile url: {profile_url}")
+
+
+def _zhihu_today_output_path(profile_url: str) -> Path:
+    slug = _zhihu_profile_slug(profile_url)
+    DEFAULT_ZHIHU_TODAY_DIR.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_ZHIHU_TODAY_DIR / f"{slug}.json"
+
+
+def _read_zhihu_today_output(profile_url: str) -> dict[str, object]:
+    output_path = _zhihu_today_output_path(profile_url)
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="zhihu today output not found")
+    return json.loads(output_path.read_text(encoding="utf-8"))
+
+
+def _zhihu_latest_publish_sort_key(item: dict[str, object]) -> tuple[int, float]:
+    today_latest_publish_time = str(item.get("today_latest_publish_time") or "")
+    if today_latest_publish_time:
+        return (0, -datetime.fromisoformat(today_latest_publish_time).timestamp())
+    profile_url = str(item.get("profile_url") or "")
+    latest_publish = ""
+    if profile_url:
+        try:
+            payload = _read_zhihu_today_output(profile_url)
+            items = payload.get("items")
+            if isinstance(items, list) and items:
+                first = items[0]
+                if isinstance(first, dict):
+                    latest_publish = str(first.get("publish_time_iso") or "")
+        except HTTPException:
+            latest_publish = ""
+    if latest_publish:
+        return (0, -datetime.fromisoformat(latest_publish).timestamp())
+    last_seen_pub_time = str(item.get("last_seen_pub_time") or "")
+    if last_seen_pub_time:
+        return (1, -datetime.fromisoformat(last_seen_pub_time).timestamp())
+    return (2, 0.0)
+
+
+def _row_to_zhihu_item(row: tuple[object, ...]) -> dict[str, object]:
+    return {
+        "content_type": row[0],
+        "publish_time_iso": row[1],
+        "updated_time_iso": row[2],
+        "url": row[3],
+        "title": row[4],
+        "content_html": row[5] or "",
+        "content_text": row[6] or "",
+        "author_name": row[7] or "",
+    }
+
+
+def _db_zhihu_today_items_by_slug(slug: str) -> list[dict[str, object]]:
+    db = _db()
+    try:
+        rows = db.execute(
+            """
+            SELECT
+                'answer' AS content_type,
+                a.created_time AS publish_time_iso,
+                a.updated_time AS updated_time_iso,
+                a.answer_url AS url,
+                a.question_title AS title,
+                a.content_html AS content_html,
+                a.content_text AS content_text,
+                au.name AS author_name
+            FROM ZhihuAnswer a
+            JOIN ZhihuAuthor au ON au.id = a.author_id
+            WHERE au.slug = ?
+              AND date(a.first_seen_at) = date('now', 'localtime')
+            UNION ALL
+            SELECT
+                'pin' AS content_type,
+                p.created_time AS publish_time_iso,
+                p.updated_time AS updated_time_iso,
+                p.pin_url AS url,
+                CASE
+                    WHEN COALESCE(NULLIF(p.excerpt_title, ''), '') != '' THEN p.excerpt_title
+                    ELSE '想法'
+                END AS title,
+                p.content_html AS content_html,
+                p.content_text AS content_text,
+                au.name AS author_name
+            FROM ZhihuPin p
+            JOIN ZhihuAuthor au ON au.id = p.author_id
+            WHERE au.slug = ?
+              AND date(p.first_seen_at) = date('now', 'localtime')
+            ORDER BY publish_time_iso DESC
+            """,
+            [slug, slug],
+        ).fetchall()
+        return [_row_to_zhihu_item(row) for row in rows]
+    finally:
+        db.close()
+
+
+def _db_zhihu_today_latest_map() -> dict[str, str]:
+    db = _db()
+    try:
+        rows = db.execute(
+            """
+            SELECT slug, MAX(publish_time_iso)
+            FROM (
+                SELECT au.slug AS slug, a.created_time AS publish_time_iso
+                FROM ZhihuAnswer a
+                JOIN ZhihuAuthor au ON au.id = a.author_id
+                WHERE date(a.first_seen_at) = date('now', 'localtime')
+                UNION ALL
+                SELECT au.slug AS slug, p.created_time AS publish_time_iso
+                FROM ZhihuPin p
+                JOIN ZhihuAuthor au ON au.id = p.author_id
+                WHERE date(p.first_seen_at) = date('now', 'localtime')
+            )
+            GROUP BY slug
+            """
+        ).fetchall()
+        return {str(row[0]): str(row[1]) for row in rows if row[0] and row[1]}
+    finally:
+        db.close()
 
 
 def _article_json(art: Article, content: str | None = None) -> dict:
@@ -96,6 +259,11 @@ def index():
 @app.get("/llm.txt", response_class=PlainTextResponse)
 def llm_txt():
     return Path("templates_web/llm.txt").read_text(encoding="utf-8")
+
+
+@app.get("/zhihu.txt", response_class=PlainTextResponse)
+def zhihu_txt():
+    return Path("templates_web/zhihu.txt").read_text(encoding="utf-8")
 
 
 # ── API ───────────────────────────────────────────────────
@@ -288,6 +456,225 @@ def api_stats():
         }
     finally:
         Client.close_all()
+
+
+@app.get("/api/zhihu/stats")
+def api_zhihu_stats():
+    snapshot = _load_following_snapshot()
+    db = _db()
+    try:
+        total_following = len(snapshot) if snapshot else db.execute("SELECT COUNT(*) FROM ZhihuAuthor WHERE is_following = 1").fetchone()[0]
+        answer_authors = db.execute("SELECT COUNT(DISTINCT author_id) FROM ZhihuAnswer").fetchone()[0]
+        total_contents = db.execute("SELECT COUNT(*) FROM ZhihuAnswer").fetchone()[0]
+        today_new = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM ZhihuAnswer
+            WHERE date(first_seen_at) = date('now', 'localtime')
+            """
+        ).fetchone()[0]
+        last_check = db.execute(
+            """
+            SELECT MAX(last_seen_at)
+            FROM (
+                SELECT last_seen_at FROM ZhihuAuthor
+                UNION ALL
+                SELECT last_seen_at FROM ZhihuAnswer
+                UNION ALL
+                SELECT last_seen_at FROM ZhihuPin
+            )
+            """
+        ).fetchone()[0]
+        return {
+            "total_following": total_following,
+            "answer_authors": answer_authors,
+            "total_contents": total_contents,
+            "today_new": today_new,
+            "last_check": last_check,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/zhihu/today")
+def api_zhihu_today():
+    db = _db()
+    try:
+        rows = db.execute(
+            """
+            SELECT
+                'answer' AS kind,
+                a.answer_id AS content_id,
+                au.name AS author_name,
+                au.profile_url AS author_url,
+                a.question_title AS title,
+                a.content_html AS content,
+                a.content_text AS content_text,
+                a.answer_url AS url,
+                a.created_time AS created_time,
+                a.updated_time AS updated_time,
+                a.first_seen_at AS first_seen_at
+            FROM ZhihuAnswer a
+            JOIN ZhihuAuthor au ON au.id = a.author_id
+            WHERE date(a.first_seen_at) = date('now', 'localtime')
+            ORDER BY first_seen_at DESC
+            """
+        ).fetchall()
+        return [
+            {
+                "kind": row[0],
+                "content_id": row[1],
+                "author_name": row[2],
+                "author_url": row[3],
+                "title": row[4],
+                "content": row[5],
+                "content_html": row[5],
+                "content_text": row[6],
+                "url": row[7],
+                "created_time": row[8],
+                "updated_time": row[9],
+                "first_seen_at": row[10],
+            }
+            for row in rows
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/api/zhihu/following-contents")
+def api_zhihu_following_contents(slug: str = Query(...)):
+    db = _db()
+    try:
+        row = db.execute(
+            """
+            SELECT profile_url, name
+            FROM ZhihuAuthor
+            WHERE slug = ?
+            LIMIT 1
+            """,
+            [slug],
+        ).fetchone()
+    finally:
+        db.close()
+    if row is None:
+        snapshot = _load_following_snapshot()
+        for item in snapshot:
+            if item["slug"] == slug:
+                row = (item["profile_url"], item["name"])
+                break
+    if row is None:
+        raise HTTPException(status_code=404, detail="zhihu following not found")
+
+    profile_url = row[0]
+    try:
+        payload = _read_zhihu_today_output(profile_url)
+    except HTTPException as error:
+        if error.status_code != 404:
+            raise
+        return {"fetched_at": None, "items": _db_zhihu_today_items_by_slug(slug)}
+    items = payload.get("items")
+    result_items = items if isinstance(items, list) else []
+    if not result_items:
+        result_items = _db_zhihu_today_items_by_slug(slug)
+    return {
+        "fetched_at": payload.get("fetched_at"),
+        "items": result_items,
+    }
+
+
+@app.get("/api/zhihu/following")
+def api_zhihu_following():
+    snapshot = _load_following_snapshot()
+    today_latest_map = _db_zhihu_today_latest_map()
+    db = _db()
+    try:
+        rows = db.execute(
+            """
+            SELECT slug, name, profile_url, headline, avatar_url, is_following, last_seen_content_id, last_seen_pub_time
+            FROM ZhihuAuthor
+            """
+        ).fetchall()
+        by_slug = {
+            row[0]: {
+                "slug": row[0],
+                "name": row[1],
+                "profile_url": row[2],
+                "headline": row[3],
+                "avatar_url": row[4],
+                "is_following": bool(row[5]),
+                "last_seen_content_id": row[6],
+                "last_seen_pub_time": row[7],
+            }
+            for row in rows
+            if row[0]
+        }
+    finally:
+        db.close()
+
+    if snapshot:
+        result = []
+        for user in snapshot:
+            item = by_slug.get(user["slug"], {})
+            merged = {**item, **user, "is_following": True}
+            merged["today_latest_publish_time"] = today_latest_map.get(user["slug"])
+            result.append(merged)
+        return sorted(result, key=_zhihu_latest_publish_sort_key)
+    result = []
+    for item in by_slug.values():
+        item = dict(item)
+        item["today_latest_publish_time"] = today_latest_map.get(item["slug"])
+        result.append(item)
+    return sorted(result, key=_zhihu_latest_publish_sort_key)
+
+
+@app.post("/api/zhihu/following-refresh")
+def api_zhihu_following_refresh(slug: str = Query(...)):
+    db = _db()
+    try:
+        row = db.execute(
+            """
+            SELECT profile_url
+            FROM ZhihuAuthor
+            WHERE slug = ?
+            LIMIT 1
+            """,
+            [slug],
+        ).fetchone()
+    finally:
+        db.close()
+    if row is None:
+        snapshot = _load_following_snapshot()
+        for item in snapshot:
+            if item["slug"] == slug:
+                row = (item["profile_url"],)
+                break
+    if row is None:
+        raise HTTPException(status_code=404, detail="zhihu following not found")
+    payload = write_sync_request("refresh-profile", profile_url=row[0], slug=slug)
+    return {"ok": True, "queued": True, **payload}
+
+
+@app.post("/api/zhihu/refresh-following")
+def api_zhihu_refresh_following():
+    payload = write_sync_request("refresh-following")
+    return {"ok": True, "queued": True, **payload}
+
+
+@app.post("/api/zhihu/check-new")
+def api_zhihu_check_new():
+    now_local = datetime.now().astimezone().time()
+    if now_local < dt_time(8, 0) or now_local >= dt_time(23, 0):
+        return {"ok": True, "skipped": True}
+    payload = write_sync_request("check-new")
+    return {"ok": True, "queued": True, **payload}
+
+
+@app.get("/api/zhihu/sync-status")
+def api_zhihu_sync_status():
+    result = read_sync_result()
+    if result is None:
+        return {"ok": True, "status": "idle"}
+    return {"ok": True, **result}
 
 
 if __name__ == "__main__":

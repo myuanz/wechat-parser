@@ -11,7 +11,7 @@ from cloakbrowser import launch_persistent_context
 DEFAULT_PROFILE_URL = "https://www.zhihu.com/people/deng-cheng-chen-17"
 DEFAULT_SIGNIN_URL = "https://www.zhihu.com/signin"
 DEFAULT_PROFILE_DIR = Path(__file__).with_name("browser_profiles") / "zhihu"
-DEFAULT_OUTPUT = Path(__file__).with_name("dumps") / "zhihu_profile_pins_min_test.json"
+DEFAULT_OUTPUT = Path("/srv/samba/share") / "zhihu_profile_pins_min_test.json"
 
 
 def normalize_pins_url(profile_url: str) -> str:
