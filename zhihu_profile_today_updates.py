@@ -579,6 +579,7 @@ def ids_by_type(items: list[dict[str, object]]) -> dict[str, list[str]]:
 def slim_item(item: dict[str, object]) -> dict[str, object]:
     return {
         "content_type": item.get("content_type"),
+        "content_id": item.get("content_id"),
         "publish_time_iso": item.get("publish_time_iso"),
         "updated_time_iso": item.get("updated_time_iso"),
         "url": item.get("url"),
@@ -586,6 +587,8 @@ def slim_item(item: dict[str, object]) -> dict[str, object]:
         "content_html": item.get("content_html"),
         "content_text": item.get("content_text"),
         "author_name": item.get("author_name"),
+        "voteup_count": item.get("voteup_count"),
+        "comment_count": item.get("comment_count"),
     }
 
 

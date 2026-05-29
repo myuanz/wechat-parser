@@ -6,6 +6,7 @@ import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from cloakbrowser import launch_persistent_context
 from dclassql import Client
@@ -22,6 +23,8 @@ DEFAULT_FOLLOWING_SNAPSHOT = Path(__file__).with_name("dumps") / "zhihu_followin
 DEFAULT_LIMIT = 20
 DEFAULT_CONTENT_LIMIT = 1
 DEFAULT_REQUEST_PROFILE_URL = "https://www.zhihu.com/people/bu-ye-cheng-76"
+DEFAULT_TODAY_OUTPUT_DIR = Path(__file__).with_name("dumps") / "zhihu_today"
+UV_BIN = Path("/home/lin/.local/bin/uv")
 INVALID_AUTHOR_SLUGS = {
     "following",
     "answers",
@@ -66,6 +69,57 @@ def sleep_random(min_seconds: float = 2, max_seconds: float = 8) -> None:
 def profile_slug(profile_url: str) -> str:
     parts = [part for part in profile_url.rstrip("/").split("/") if part]
     return parts[-1]
+
+
+def today_output_path(profile_url: str) -> Path:
+    DEFAULT_TODAY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_TODAY_OUTPUT_DIR / f"{profile_slug(profile_url)}.json"
+
+
+def run_today_updates(profile_url: str, profile_dir: Path = DEFAULT_PROFILE_DIR) -> dict[str, object]:
+    output_path = today_output_path(profile_url)
+    cmd = [
+        str(UV_BIN),
+        "run",
+        "python",
+        str(Path(__file__).with_name("zhihu_profile_today_updates.py")),
+        "--url",
+        profile_url,
+        "--headless",
+        "--profile-dir",
+        str(profile_dir),
+        "--output",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, cwd=Path(__file__).parent, capture_output=True, text=True, timeout=180)
+    if result.returncode != 0:
+        raise RuntimeError(f"今日更新脚本失败: stdout={result.stdout} stderr={result.stderr}")
+    import_stats = import_today_output_file(profile_url, output_path)
+    return {
+        "output_path": str(output_path),
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        **import_stats,
+    }
+
+
+def content_id_from_item(item: dict[str, object]) -> str:
+    content_id = str(item.get("content_id") or "")
+    if content_id:
+        return content_id
+    content_type = str(item.get("content_type") or "")
+    url = str(item.get("url") or "")
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if content_type == "pin" and parts and parts[0] == "pin":
+        return parts[-1]
+    if content_type == "article" and parts:
+        return parts[-1]
+    if content_type == "answer" and "answer" in parts:
+        return parts[-1]
+    return ""
 
 
 def should_skip_following_user(user: dict[str, str]) -> bool:
@@ -401,6 +455,224 @@ def ensure_author_record(client: Client, slug: str, name: str, now_value: dateti
     return client.zhihu_author.find_first(where={"slug": slug})
 
 
+def upsert_article_from_today_item(client: Client, author, item: dict[str, object], now_value: datetime) -> bool:
+    article_id = content_id_from_item(item)
+    if not article_id:
+        return False
+    created_dt = to_dt(item.get("publish_time_iso"))
+    updated_dt = to_dt(item.get("updated_time_iso")) or created_dt
+    if created_dt is None or updated_dt is None:
+        raise RuntimeError(f"文章时间字段缺失: {article_id}")
+    content_html = str(item.get("content_html") or "")
+    content_text = str(item.get("content_text") or "")
+    title = str(item.get("title") or "")
+    existing = client.zhihu_article.find_first(where={"article_id": article_id})
+    payload = {
+        "author_id": author.id,
+        "article_url": str(item.get("url") or f"https://zhuanlan.zhihu.com/p/{article_id}"),
+        "title": title,
+        "excerpt": content_text,
+        "content_html": content_html,
+        "content_text": content_text,
+        "created_time": created_dt,
+        "updated_time": updated_dt,
+        "last_seen_at": now_value,
+        "voteup_count": int(item.get("voteup_count") or 0),
+        "comment_count": int(item.get("comment_count") or 0),
+    }
+    if existing is None:
+        client.zhihu_article.upsert(
+            where={"article_id": article_id},
+            update={"last_seen_at": now_value},
+            insert={"article_id": article_id, "first_seen_at": now_value, **payload},
+        )
+        client.zhihu_author.update(
+            where={"id": author.id},
+            data={"last_seen_content_id": article_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
+        )
+        return True
+    if existing.updated_time < updated_dt or existing.created_time < created_dt or not existing.content_html.strip():
+        client.zhihu_article.update(where={"id": existing.id}, data=payload)
+        client.zhihu_author.update(
+            where={"id": author.id},
+            data={"last_seen_content_id": article_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
+        )
+    else:
+        client.zhihu_article.update(where={"id": existing.id}, data={"last_seen_at": now_value})
+    return False
+
+
+def upsert_pin_from_today_item(client: Client, author, item: dict[str, object], now_value: datetime) -> bool:
+    pin_id = content_id_from_item(item)
+    if not pin_id:
+        return False
+    created_dt = to_dt(item.get("publish_time_iso"))
+    updated_dt = to_dt(item.get("updated_time_iso")) or created_dt
+    if created_dt is None or updated_dt is None:
+        raise RuntimeError(f"想法时间字段缺失: {pin_id}")
+    title = str(item.get("title") or "")
+    content_html = str(item.get("content_html") or "")
+    content_text = str(item.get("content_text") or "")
+    existing = client.zhihu_pin.find_first(where={"pin_id": pin_id})
+    payload = {
+        "author_id": author.id,
+        "pin_url": str(item.get("url") or f"https://www.zhihu.com/pin/{pin_id}"),
+        "excerpt_title": title,
+        "content_html": content_html,
+        "content_text": content_text,
+        "created_time": created_dt,
+        "updated_time": updated_dt,
+        "last_seen_at": now_value,
+        "like_count": int(item.get("voteup_count") or 0),
+        "comment_count": int(item.get("comment_count") or 0),
+        "reaction_count": int(item.get("voteup_count") or 0),
+    }
+    if existing is None:
+        client.zhihu_pin.upsert(
+            where={"pin_id": pin_id},
+            update={"last_seen_at": now_value},
+            insert={"pin_id": pin_id, "first_seen_at": now_value, **payload},
+        )
+        client.zhihu_author.update(
+            where={"id": author.id},
+            data={"last_seen_content_id": pin_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
+        )
+        return True
+    if existing.updated_time < updated_dt or existing.created_time < created_dt or not existing.content_html.strip():
+        client.zhihu_pin.update(where={"id": existing.id}, data=payload)
+        client.zhihu_author.update(
+            where={"id": author.id},
+            data={"last_seen_content_id": pin_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
+        )
+    else:
+        client.zhihu_pin.update(where={"id": existing.id}, data={"last_seen_at": now_value})
+    return False
+
+
+def upsert_answer_from_today_item(client: Client, author, item: dict[str, object], now_value: datetime) -> bool:
+    answer_id = content_id_from_item(item)
+    if not answer_id:
+        return False
+    created_dt = to_dt(item.get("publish_time_iso"))
+    updated_dt = to_dt(item.get("updated_time_iso")) or created_dt
+    if created_dt is None or updated_dt is None:
+        raise RuntimeError(f"回答时间字段缺失: {answer_id}")
+    content_html = str(item.get("content_html") or "")
+    content_text = str(item.get("content_text") or "")
+    title = str(item.get("title") or "")
+    url = str(item.get("url") or "")
+    question_id = ""
+    if "/question/" in url and "/answer/" in url:
+        parts = url.split("/")
+        try:
+            question_id = parts[parts.index("question") + 1]
+        except (ValueError, IndexError):
+            question_id = ""
+    existing = client.zhihu_answer.find_first(where={"answer_id": answer_id})
+    payload = {
+        "author_id": author.id,
+        "question_id": question_id,
+        "question_title": title,
+        "question_api_url": "",
+        "answer_api_url": "",
+        "answer_url": url,
+        "excerpt": content_text,
+        "content_html": content_html,
+        "content_text": content_text,
+        "created_time": created_dt,
+        "updated_time": updated_dt,
+        "last_seen_at": now_value,
+        "voteup_count": int(item.get("voteup_count") or 0),
+        "comment_count": int(item.get("comment_count") or 0),
+        "thanks_count": None,
+    }
+    if existing is None:
+        client.zhihu_answer.upsert(
+            where={"answer_id": answer_id},
+            update={"last_seen_at": now_value},
+            insert={"answer_id": answer_id, "first_seen_at": now_value, **payload},
+        )
+        client.zhihu_author.update(
+            where={"id": author.id},
+            data={"last_seen_content_id": answer_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
+        )
+        return True
+    if existing.updated_time < updated_dt or existing.created_time < created_dt or not existing.content_html.strip():
+        client.zhihu_answer.update(where={"id": existing.id}, data=payload)
+        client.zhihu_author.update(
+            where={"id": author.id},
+            data={"last_seen_content_id": answer_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
+        )
+    else:
+        client.zhihu_answer.update(where={"id": existing.id}, data={"last_seen_at": now_value})
+    return False
+
+
+def import_today_payload(profile_url: str, payload: dict[str, object]) -> dict[str, int]:
+    slug = profile_slug(profile_url)
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError("今日更新输出格式不对: items 缺失")
+    client = Client()
+    now_value = now()
+    try:
+        author = client.zhihu_author.find_first(where={"slug": slug})
+        author_name = ""
+        for raw_item in items:
+            if isinstance(raw_item, dict) and str(raw_item.get("author_name") or "").strip():
+                author_name = str(raw_item.get("author_name") or "").strip()
+                break
+        if author is None:
+            author = ensure_author_record(client, slug, author_name or slug, now_value)
+        elif author_name and author.name != author_name:
+            client.zhihu_author.update(where={"id": author.id}, data={"name": author_name, "updated_at": now_value})
+            author = client.zhihu_author.find_first(where={"id": author.id})
+        if author is None:
+            raise RuntimeError(f"知乎作者不存在: {slug}")
+
+        stats = {"new_answers": 0, "new_articles": 0, "new_pins": 0}
+        latest_pub_time: datetime | None = author.last_seen_pub_time
+        latest_content_id = author.last_seen_content_id
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                continue
+            content_type = str(raw_item.get("content_type") or "")
+            if content_type == "answer":
+                is_new = upsert_answer_from_today_item(client, author, raw_item, now_value)
+                stats["new_answers"] += int(is_new)
+            elif content_type == "article":
+                is_new = upsert_article_from_today_item(client, author, raw_item, now_value)
+                stats["new_articles"] += int(is_new)
+            elif content_type == "pin":
+                is_new = upsert_pin_from_today_item(client, author, raw_item, now_value)
+                stats["new_pins"] += int(is_new)
+            else:
+                continue
+            item_pub_time = to_dt(raw_item.get("publish_time_iso"))
+            item_content_id = content_id_from_item(raw_item)
+            if item_pub_time is not None and (latest_pub_time is None or item_pub_time >= latest_pub_time):
+                latest_pub_time = item_pub_time
+                latest_content_id = item_content_id or latest_content_id
+        client.zhihu_author.update(
+            where={"id": author.id},
+            data={
+                "profile_url": profile_url,
+                "last_seen_content_id": latest_content_id,
+                "last_seen_pub_time": latest_pub_time,
+                "last_seen_at": now_value,
+                "updated_at": now_value,
+            },
+        )
+        return stats
+    finally:
+        Client.close_all()
+
+
+def import_today_output_file(profile_url: str, output_path: Path) -> dict[str, int]:
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    return import_today_payload(profile_url, payload)
+
+
 def upsert_answer(client: Client, author, item: dict[str, object], detail: dict[str, object] | None = None) -> bool:
     answer_id = str(item.get("answer_id") or "")
     if not answer_id:
@@ -730,37 +1002,20 @@ def repair_answer_authors(
 
 def sync_zhihu(profile_url: str = DEFAULT_PROFILE_URL, profile_dir: Path = DEFAULT_PROFILE_DIR, signin_url: str = DEFAULT_SIGNIN_URL, login_wait: int = 300) -> dict[str, int]:
     profile_dir.mkdir(parents=True, exist_ok=True)
-    previous_display = subprocess.os.environ.get("DISPLAY")
-    previous_xauthority = subprocess.os.environ.get("XAUTHORITY")
-    subprocess.os.environ["DISPLAY"] = DEFAULT_X_DISPLAY
-    subprocess.os.environ["XAUTHORITY"] = DEFAULT_XAUTHORITY
-    context = launch_persistent_context(profile_dir, headless=False, locale="zh-CN", timezone="Asia/Shanghai", humanize=True, viewport={"width": 1280, "height": 900})
+    refresh_following(profile_url=profile_url, profile_dir=profile_dir, signin_url=signin_url, login_wait=login_wait)
     client = Client()
     try:
-        page = context.new_page()
-        users = sync_following(client, page, profile_url, signin_url, login_wait)
-        stats = {"new_answers": 0, "new_pins": 0}
         authors = client.zhihu_author.find_many(where={"is_following": True}, order_by={"updated_at": "desc"})
-        seen = {user["url"] for user in users}
+        stats = {"new_answers": 0, "new_articles": 0, "new_pins": 0}
         for author in authors:
-            if author.profile_url not in seen:
-                continue
+            result = run_today_updates(author.profile_url, profile_dir=profile_dir)
+            stats["new_answers"] += int(result.get("new_answers", 0))
+            stats["new_articles"] += int(result.get("new_articles", 0))
+            stats["new_pins"] += int(result.get("new_pins", 0))
             sleep_random()
-            result = sync_author_contents(client, page, author, first_run=author.last_seen_content_id is None)
-            stats["new_answers"] += result["new_answers"]
-            stats["new_pins"] += result["new_pins"]
         return stats
     finally:
         Client.close_all()
-        context.close()
-        if previous_display is None:
-            subprocess.os.environ.pop("DISPLAY", None)
-        else:
-            subprocess.os.environ["DISPLAY"] = previous_display
-        if previous_xauthority is None:
-            subprocess.os.environ.pop("XAUTHORITY", None)
-        else:
-            subprocess.os.environ["XAUTHORITY"] = previous_xauthority
 
 
 def refresh_following(profile_url: str = DEFAULT_PROFILE_URL, profile_dir: Path = DEFAULT_PROFILE_DIR, signin_url: str = DEFAULT_SIGNIN_URL, login_wait: int = 300) -> dict[str, int]:
@@ -795,16 +1050,10 @@ def sync_single_author(
     signin_url: str = DEFAULT_SIGNIN_URL,
     login_wait: int = 300,
 ) -> dict[str, int]:
+    del signin_url, login_wait
     profile_dir.mkdir(parents=True, exist_ok=True)
-    previous_display = subprocess.os.environ.get("DISPLAY")
-    previous_xauthority = subprocess.os.environ.get("XAUTHORITY")
-    subprocess.os.environ["DISPLAY"] = DEFAULT_X_DISPLAY
-    subprocess.os.environ["XAUTHORITY"] = DEFAULT_XAUTHORITY
-    context = launch_persistent_context(profile_dir, headless=False, locale="zh-CN", timezone="Asia/Shanghai", humanize=True, viewport={"width": 1280, "height": 900})
     client = Client()
     try:
-        page = context.new_page()
-        wait_for_login(page, signin_url, login_wait)
         author = client.zhihu_author.find_first(where={"slug": author_slug})
         snapshot_user = next((user for user in load_following_snapshot() if user["slug"] == author_slug), None)
         now_value = now()
@@ -826,18 +1075,14 @@ def sync_single_author(
         author = client.zhihu_author.find_first(where={"id": author.id})
         if author is None:
             raise RuntimeError(f"知乎作者不存在: {author_slug}")
-        return sync_author_contents(client, page, author, first_run=author.last_seen_content_id is None)
+        result = run_today_updates(profile_url, profile_dir=profile_dir)
+        return {
+            "new_answers": int(result.get("new_answers", 0)),
+            "new_articles": int(result.get("new_articles", 0)),
+            "new_pins": int(result.get("new_pins", 0)),
+        }
     finally:
         Client.close_all()
-        context.close()
-        if previous_display is None:
-            subprocess.os.environ.pop("DISPLAY", None)
-        else:
-            subprocess.os.environ["DISPLAY"] = previous_display
-        if previous_xauthority is None:
-            subprocess.os.environ.pop("XAUTHORITY", None)
-        else:
-            subprocess.os.environ["XAUTHORITY"] = previous_xauthority
 
 
 def write_sync_request(action: str, profile_url: str = DEFAULT_REQUEST_PROFILE_URL, **extra: object) -> dict[str, object]:

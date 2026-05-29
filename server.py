@@ -4,7 +4,6 @@ import json
 from datetime import time as dt_time
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 import html_to_markdown
 from compression import zstd
@@ -13,11 +12,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from db_model import Article, DB_PATH
-from zhihu_sync import read_sync_result, sync_single_author, write_sync_request
+from zhihu_sync import read_sync_result, run_today_updates, write_sync_request
 
 app = FastAPI(title="wechat-parser")
 DEFAULT_FOLLOWING_SNAPSHOT = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
-DEFAULT_ZHIHU_TODAY_DIR = Path(__file__).with_name("dumps") / "zhihu_today"
 
 
 def _db():
@@ -64,44 +62,10 @@ def _load_following_snapshot() -> list[dict[str, str]]:
     return result
 
 
-def _zhihu_profile_slug(profile_url: str) -> str:
-    parts = [part for part in urlparse(profile_url).path.split("/") if part]
-    if len(parts) >= 2 and parts[0] in {"people", "org"}:
-        return parts[1]
-    raise HTTPException(status_code=400, detail=f"invalid zhihu profile url: {profile_url}")
-
-
-def _zhihu_today_output_path(profile_url: str) -> Path:
-    slug = _zhihu_profile_slug(profile_url)
-    DEFAULT_ZHIHU_TODAY_DIR.mkdir(parents=True, exist_ok=True)
-    return DEFAULT_ZHIHU_TODAY_DIR / f"{slug}.json"
-
-
-def _read_zhihu_today_output(profile_url: str) -> dict[str, object]:
-    output_path = _zhihu_today_output_path(profile_url)
-    if not output_path.exists():
-        raise HTTPException(status_code=404, detail="zhihu today output not found")
-    return json.loads(output_path.read_text(encoding="utf-8"))
-
-
 def _zhihu_latest_publish_sort_key(item: dict[str, object]) -> tuple[int, float]:
     today_latest_publish_time = str(item.get("today_latest_publish_time") or "")
     if today_latest_publish_time:
         return (0, -datetime.fromisoformat(today_latest_publish_time).timestamp())
-    profile_url = str(item.get("profile_url") or "")
-    latest_publish = ""
-    if profile_url:
-        try:
-            payload = _read_zhihu_today_output(profile_url)
-            items = payload.get("items")
-            if isinstance(items, list) and items:
-                first = items[0]
-                if isinstance(first, dict):
-                    latest_publish = str(first.get("publish_time_iso") or "")
-        except HTTPException:
-            latest_publish = ""
-    if latest_publish:
-        return (0, -datetime.fromisoformat(latest_publish).timestamp())
     last_seen_pub_time = str(item.get("last_seen_pub_time") or "")
     if last_seen_pub_time:
         return (1, -datetime.fromisoformat(last_seen_pub_time).timestamp())
@@ -154,9 +118,22 @@ def _db_zhihu_contents_by_slug(slug: str) -> list[dict[str, object]]:
             FROM ZhihuPin p
             JOIN ZhihuAuthor au ON au.id = p.author_id
             WHERE au.slug = ?
+            UNION ALL
+            SELECT
+                'article' AS content_type,
+                ar.created_time AS publish_time_iso,
+                ar.updated_time AS updated_time_iso,
+                ar.article_url AS url,
+                ar.title AS title,
+                ar.content_html AS content_html,
+                ar.content_text AS content_text,
+                au.name AS author_name
+            FROM ZhihuArticle ar
+            JOIN ZhihuAuthor au ON au.id = ar.author_id
+            WHERE au.slug = ?
             ORDER BY publish_time_iso DESC
             """,
-            [slug, slug],
+            [slug, slug, slug],
         ).fetchall()
         return [_row_to_zhihu_item(row) for row in rows]
     finally:
@@ -179,6 +156,11 @@ def _db_zhihu_today_latest_map() -> dict[str, str]:
                 FROM ZhihuPin p
                 JOIN ZhihuAuthor au ON au.id = p.author_id
                 WHERE date(p.first_seen_at) = date('now', 'localtime')
+                UNION ALL
+                SELECT au.slug AS slug, ar.created_time AS publish_time_iso
+                FROM ZhihuArticle ar
+                JOIN ZhihuAuthor au ON au.id = ar.author_id
+                WHERE date(ar.first_seen_at) = date('now', 'localtime')
             )
             GROUP BY slug
             """
@@ -463,11 +445,26 @@ def api_zhihu_stats():
     try:
         total_following = len(snapshot) if snapshot else db.execute("SELECT COUNT(*) FROM ZhihuAuthor WHERE is_following = 1").fetchone()[0]
         answer_authors = db.execute("SELECT COUNT(DISTINCT author_id) FROM ZhihuAnswer").fetchone()[0]
-        total_contents = db.execute("SELECT COUNT(*) FROM ZhihuAnswer").fetchone()[0]
+        article_authors = db.execute("SELECT COUNT(DISTINCT author_id) FROM ZhihuArticle").fetchone()[0]
+        pin_authors = db.execute("SELECT COUNT(DISTINCT author_id) FROM ZhihuPin").fetchone()[0]
+        total_contents = db.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM ZhihuAnswer) +
+                (SELECT COUNT(*) FROM ZhihuArticle) +
+                (SELECT COUNT(*) FROM ZhihuPin)
+            """
+        ).fetchone()[0]
         today_new = db.execute(
             """
             SELECT COUNT(*)
-            FROM ZhihuAnswer
+            FROM (
+                SELECT first_seen_at FROM ZhihuAnswer
+                UNION ALL
+                SELECT first_seen_at FROM ZhihuArticle
+                UNION ALL
+                SELECT first_seen_at FROM ZhihuPin
+            )
             WHERE date(first_seen_at) = date('now', 'localtime')
             """
         ).fetchone()[0]
@@ -479,6 +476,8 @@ def api_zhihu_stats():
                 UNION ALL
                 SELECT last_seen_at FROM ZhihuAnswer
                 UNION ALL
+                SELECT last_seen_at FROM ZhihuArticle
+                UNION ALL
                 SELECT last_seen_at FROM ZhihuPin
             )
             """
@@ -486,6 +485,8 @@ def api_zhihu_stats():
         return {
             "total_following": total_following,
             "answer_authors": answer_authors,
+            "article_authors": article_authors,
+            "pin_authors": pin_authors,
             "total_contents": total_contents,
             "today_new": today_new,
             "last_check": last_check,
@@ -515,6 +516,41 @@ def api_zhihu_today():
             FROM ZhihuAnswer a
             JOIN ZhihuAuthor au ON au.id = a.author_id
             WHERE date(a.first_seen_at) = date('now', 'localtime')
+            UNION ALL
+            SELECT
+                'article' AS kind,
+                ar.article_id AS content_id,
+                au.name AS author_name,
+                au.profile_url AS author_url,
+                ar.title AS title,
+                ar.content_html AS content,
+                ar.content_text AS content_text,
+                ar.article_url AS url,
+                ar.created_time AS created_time,
+                ar.updated_time AS updated_time,
+                ar.first_seen_at AS first_seen_at
+            FROM ZhihuArticle ar
+            JOIN ZhihuAuthor au ON au.id = ar.author_id
+            WHERE date(ar.first_seen_at) = date('now', 'localtime')
+            UNION ALL
+            SELECT
+                'pin' AS kind,
+                p.pin_id AS content_id,
+                au.name AS author_name,
+                au.profile_url AS author_url,
+                CASE
+                    WHEN COALESCE(NULLIF(p.excerpt_title, ''), '') != '' THEN p.excerpt_title
+                    ELSE '想法'
+                END AS title,
+                p.content_html AS content,
+                p.content_text AS content_text,
+                p.pin_url AS url,
+                p.created_time AS created_time,
+                p.updated_time AS updated_time,
+                p.first_seen_at AS first_seen_at
+            FROM ZhihuPin p
+            JOIN ZhihuAuthor au ON au.id = p.author_id
+            WHERE date(p.first_seen_at) = date('now', 'localtime')
             ORDER BY first_seen_at DESC
             """
         ).fetchall()
@@ -639,15 +675,16 @@ def api_zhihu_following_refresh(slug: str = Query(...)):
         raise HTTPException(status_code=404, detail="zhihu following not found")
     profile_url = str(row[0])
     try:
-        result = sync_single_author(slug, profile_url)
+        result = run_today_updates(profile_url)
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
     return {
         "ok": True,
         "slug": slug,
         "profile_url": profile_url,
-        "new_items_count": int(result.get("new_answers", 0)) + int(result.get("new_pins", 0)),
+        "new_items_count": int(result.get("new_answers", 0)) + int(result.get("new_articles", 0)) + int(result.get("new_pins", 0)),
         "new_answers": int(result.get("new_answers", 0)),
+        "new_articles": int(result.get("new_articles", 0)),
         "new_pins": int(result.get("new_pins", 0)),
     }
 

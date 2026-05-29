@@ -129,6 +129,7 @@ class ZhihuAuthor:
     updated_at: datetime
 
     answers: list["ZhihuAnswer"]
+    articles: list["ZhihuArticle"]
     pins: list["ZhihuPin"]
 
     def index(self):
@@ -209,3 +210,35 @@ class ZhihuPin:
 
     def foreign_key(self):
         yield self.author.id == self.author_id, ZhihuAuthor.pins
+
+
+@dataclass
+class ZhihuArticle:
+    id: int
+    article_id: str
+    author_id: int
+    author: ZhihuAuthor
+
+    article_url: str
+    title: str
+    excerpt: str
+    content_html: str
+    content_text: str
+    created_time: datetime
+    updated_time: datetime
+    first_seen_at: datetime
+    last_seen_at: datetime
+    voteup_count: int
+    comment_count: int
+
+    def index(self):
+        yield self.author_id
+        yield self.created_time
+        yield self.updated_time
+        yield self.last_seen_at
+
+    def unique_index(self):
+        yield self.article_id
+
+    def foreign_key(self):
+        yield self.author.id == self.author_id, ZhihuAuthor.articles

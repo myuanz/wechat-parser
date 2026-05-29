@@ -1,8 +1,6 @@
 import json
-import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
 
 from zhihu_sync import (
     DEFAULT_PROFILE_DIR,
@@ -10,6 +8,7 @@ from zhihu_sync import (
     clear_sync_request,
     read_sync_request,
     refresh_following,
+    run_today_updates,
     sync_zhihu,
     write_sync_result,
 )
@@ -18,9 +17,7 @@ from zhihu_sync import (
 DAY_START_HOUR = 8
 DAY_END_HOUR = 23
 AUTO_CHECK_INTERVAL = timedelta(hours=4)
-DEFAULT_TODAY_OUTPUT_DIR = Path(__file__).with_name("dumps") / "zhihu_today"
 DEFAULT_AUTO_STATE_PATH = Path(__file__).with_name("dumps") / "zhihu_auto_check_state.json"
-UV_BIN = Path("/home/lin/.local/bin/uv")
 
 
 def now_local() -> datetime:
@@ -29,43 +26,6 @@ def now_local() -> datetime:
 
 def in_auto_window(dt: datetime) -> bool:
     return DAY_START_HOUR <= dt.hour < DAY_END_HOUR
-
-
-def profile_slug(profile_url: str) -> str:
-    parts = [part for part in urlparse(profile_url).path.split("/") if part]
-    if len(parts) >= 2 and parts[0] in {"people", "org"}:
-        return parts[1]
-    raise ValueError(f"不是有效的知乎主页: {profile_url}")
-
-
-def today_output_path(profile_url: str) -> Path:
-    DEFAULT_TODAY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return DEFAULT_TODAY_OUTPUT_DIR / f"{profile_slug(profile_url)}.json"
-
-
-def run_today_updates(profile_url: str) -> dict[str, object]:
-    output_path = today_output_path(profile_url)
-    cmd = [
-        str(UV_BIN),
-        "run",
-        "python",
-        str(Path(__file__).with_name("zhihu_profile_today_updates.py")),
-        "--url",
-        profile_url,
-        "--headless",
-        "--profile-dir",
-        str(DEFAULT_PROFILE_DIR),
-        "--output",
-        str(output_path),
-    ]
-    result = subprocess.run(cmd, cwd=Path(__file__).parent, capture_output=True, text=True, timeout=180)
-    if result.returncode != 0:
-        raise RuntimeError(f"今日更新脚本失败: stdout={result.stdout} stderr={result.stderr}")
-    return {
-        "output_path": str(output_path),
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    }
 
 
 def read_auto_check_state() -> datetime | None:
