@@ -1,0 +1,61 @@
+# zhihu-parser JSON API
+
+Base URL: https://wechat.mkyr.fun
+
+## GET /api/zhihu/stats
+
+返回知乎采集概况统计。
+
+响应: application/json
+```json
+{
+  "total_following": 128,
+  "answer_authors": 96,
+  "pin_authors": 74,
+  "total_contents": 3821,
+  "today_new": 7,
+  "last_check": "2026-05-26T14:40:00+08:00"
+}
+```
+
+字段说明:
+- total_following: 已收录的知乎关注人数
+- answer_authors: 有回答内容的作者数
+- pin_authors: 有想法内容的作者数
+- total_contents: 已收录内容总数
+- today_new: 今日新增内容数
+- last_check: 最近一次检查时间
+
+## GET /api/zhihu/following
+
+返回已关注的知乎账号列表，前端左侧列表使用这个接口。
+
+## GET /api/zhihu/following-contents?slug={slug}
+
+返回某个知乎账号今天的新内容列表。
+
+响应中的正文相关字段约定：
+- `content_html`: 正文 HTML，回答和想法的网页正文优先读这个字段
+- `content_text`: 去标签后的纯文本正文，适合检索或纯文本展示
+
+## GET /api/zhihu/today
+
+返回今天抓到的知乎回答列表。
+
+响应中的正文相关字段约定：
+- `content`: 当前等同于 `content_html`，为兼容旧调用方保留
+- `content_html`: 正文 HTML
+- `content_text`: 去标签后的纯文本
+
+## POST /api/zhihu/refresh-following
+
+刷新知乎关注列表。
+
+## POST /api/zhihu/check-new
+
+检查已关注作者的新内容。
+
+## 内容类型
+
+- 回答：`/api/v4/members/{slug}/answers`
+- 想法：`/api/v4/v2/members/{slug}/pins`

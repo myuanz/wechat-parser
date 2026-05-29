@@ -1,15 +1,21 @@
 import json
 import random
 import argparse
+import fcntl
+import sqlite3
 import sys
 import subprocess
+import threading
 import time
-from datetime import UTC, datetime
+import traceback
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
 from cloakbrowser import launch_persistent_context
 from dclassql import Client
+from db_model import DB_PATH
 from x11_wechat import DEFAULT_XAUTHORITY, DEFAULT_X_DISPLAY
 from zhihu_following_collect import collect_all_following, is_login_page, wait_for_login
 from zhihu_profile_today_updates import collect_today_updates
@@ -40,6 +46,11 @@ INVALID_AUTHOR_NAMES = {
     "文章",
     "关注者",
 }
+ZH_BROWSER_LOCK_PATH = Path("/tmp/zhihu-browser.lock")
+_zh_browser_lock = threading.Lock()
+_zh_browser_lock_depth = 0
+_zh_browser_lock_file = None
+STALE_RUNNING_TASK_TIMEOUT = timedelta(minutes=30)
 
 
 def now() -> datetime:
@@ -59,6 +70,20 @@ def to_dt(value: object) -> datetime | None:
     return None
 
 
+def comparable_dt(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone().replace(tzinfo=None)
+
+
+def dt_lt(left: datetime, right: datetime) -> bool:
+    return comparable_dt(left) < comparable_dt(right)
+
+
+def dt_lte(left: datetime, right: datetime) -> bool:
+    return comparable_dt(left) <= comparable_dt(right)
+
+
 def sleep_random(min_seconds: float = 2, max_seconds: float = 8) -> None:
     time.sleep(random.uniform(min_seconds, max_seconds))
 
@@ -68,18 +93,41 @@ def profile_slug(profile_url: str) -> str:
     return parts[-1]
 
 
+@contextmanager
+def zhihu_browser_lock():
+    global _zh_browser_lock_depth, _zh_browser_lock_file
+    with _zh_browser_lock:
+        if _zh_browser_lock_depth == 0:
+            lock_file = ZH_BROWSER_LOCK_PATH.open("w")
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            _zh_browser_lock_file = lock_file
+        _zh_browser_lock_depth += 1
+    try:
+        yield
+    finally:
+        with _zh_browser_lock:
+            _zh_browser_lock_depth -= 1
+            if _zh_browser_lock_depth == 0:
+                if _zh_browser_lock_file is None:
+                    raise RuntimeError("知乎浏览器锁状态错误")
+                fcntl.flock(_zh_browser_lock_file.fileno(), fcntl.LOCK_UN)
+                _zh_browser_lock_file.close()
+                _zh_browser_lock_file = None
+
+
 def run_today_updates(profile_url: str, profile_dir: Path = DEFAULT_PROFILE_DIR) -> dict[str, object]:
-    payload = collect_today_updates(
-        profile_url=profile_url,
-        profile_dir=profile_dir,
-        headless=True,
-    )
-    import_stats = import_today_payload(profile_url, payload)
-    return {
-        "fetched_at": payload.get("fetched_at"),
-        "total_count": payload.get("total_count"),
-        **import_stats,
-    }
+    with zhihu_browser_lock():
+        payload = collect_today_updates(
+            profile_url=profile_url,
+            profile_dir=profile_dir,
+            headless=True,
+        )
+        import_stats = import_today_payload(profile_url, payload)
+        return {
+            "fetched_at": payload.get("fetched_at"),
+            "total_count": payload.get("total_count"),
+            **import_stats,
+        }
 
 
 def content_id_from_item(item: dict[str, object]) -> str:
@@ -459,7 +507,7 @@ def upsert_article_from_today_item(client: Client, author, item: dict[str, objec
             data={"last_seen_content_id": article_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
         )
         return True
-    if existing.updated_time < updated_dt or existing.created_time < created_dt or not existing.content_html.strip():
+    if dt_lt(existing.updated_time, updated_dt) or dt_lt(existing.created_time, created_dt) or not existing.content_html.strip():
         client.zhihu_article.update(where={"id": existing.id}, data=payload)
         client.zhihu_author.update(
             where={"id": author.id},
@@ -506,7 +554,7 @@ def upsert_pin_from_today_item(client: Client, author, item: dict[str, object], 
             data={"last_seen_content_id": pin_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
         )
         return True
-    if existing.updated_time < updated_dt or existing.created_time < created_dt or not existing.content_html.strip():
+    if dt_lt(existing.updated_time, updated_dt) or dt_lt(existing.created_time, created_dt) or not existing.content_html.strip():
         client.zhihu_pin.update(where={"id": existing.id}, data=payload)
         client.zhihu_author.update(
             where={"id": author.id},
@@ -565,7 +613,7 @@ def upsert_answer_from_today_item(client: Client, author, item: dict[str, object
             data={"last_seen_content_id": answer_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
         )
         return True
-    if existing.updated_time < updated_dt or existing.created_time < created_dt or not existing.content_html.strip():
+    if dt_lt(existing.updated_time, updated_dt) or dt_lt(existing.created_time, created_dt) or not existing.content_html.strip():
         client.zhihu_answer.update(where={"id": existing.id}, data=payload)
         client.zhihu_author.update(
             where={"id": author.id},
@@ -618,7 +666,7 @@ def import_today_payload(profile_url: str, payload: dict[str, object]) -> dict[s
                 continue
             item_pub_time = to_dt(raw_item.get("publish_time_iso"))
             item_content_id = content_id_from_item(raw_item)
-            if item_pub_time is not None and (latest_pub_time is None or item_pub_time >= latest_pub_time):
+            if item_pub_time is not None and (latest_pub_time is None or dt_lte(latest_pub_time, item_pub_time)):
                 latest_pub_time = item_pub_time
                 latest_content_id = item_content_id or latest_content_id
         client.zhihu_author.update(
@@ -701,7 +749,7 @@ def upsert_answer(client: Client, author, item: dict[str, object], detail: dict[
             data={"last_seen_content_id": answer_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
         )
         return True
-    if existing.updated_time < updated_dt or existing.created_time < created_dt or not existing.content_html.strip():
+    if dt_lt(existing.updated_time, updated_dt) or dt_lt(existing.created_time, created_dt) or not existing.content_html.strip():
         client.zhihu_answer.update(
             where={"id": existing.id},
             data={
@@ -779,7 +827,7 @@ def upsert_pin(client: Client, author, item: dict[str, object]) -> bool:
             data={"last_seen_content_id": pin_id, "last_seen_pub_time": created_dt, "updated_at": now_value},
         )
         return True
-    if existing.updated_time < updated_dt or existing.created_time < created_dt:
+    if dt_lt(existing.updated_time, updated_dt) or dt_lt(existing.created_time, created_dt):
         client.zhihu_pin.update(where={"id": existing.id}, data=payload)
         client.zhihu_author.update(
             where={"id": author.id},
@@ -799,9 +847,9 @@ def sync_author_contents(client: Client, page, author, first_run: bool) -> dict[
 
     if first_run:
         start_dt = today_start_utc()
-        candidates = [item for item in candidates if (created := answer_created_dt(item)) is not None and created >= start_dt]
+        candidates = [item for item in candidates if (created := answer_created_dt(item)) is not None and dt_lte(start_dt, created)]
     elif isinstance(last_seen_pub_time, datetime):
-        candidates = [item for item in candidates if (created := answer_created_dt(item)) is not None and created > last_seen_pub_time]
+        candidates = [item for item in candidates if (created := answer_created_dt(item)) is not None and dt_lt(last_seen_pub_time, created)]
 
     for item in candidates:
         answer_id = str(item.get("answer_id") or "")
@@ -963,18 +1011,48 @@ def repair_answer_authors(
             subprocess.os.environ["XAUTHORITY"] = previous_xauthority
 
 
-def sync_zhihu(profile_url: str = DEFAULT_PROFILE_URL, profile_dir: Path = DEFAULT_PROFILE_DIR, signin_url: str = DEFAULT_SIGNIN_URL, login_wait: int = 300) -> dict[str, int]:
+def sync_zhihu(profile_url: str = DEFAULT_PROFILE_URL, profile_dir: Path = DEFAULT_PROFILE_DIR, signin_url: str = DEFAULT_SIGNIN_URL, login_wait: int = 300) -> dict[str, object]:
+    del profile_url, signin_url, login_wait
     profile_dir.mkdir(parents=True, exist_ok=True)
-    refresh_following(profile_url=profile_url, profile_dir=profile_dir, signin_url=signin_url, login_wait=login_wait)
     client = Client()
     try:
         authors = client.zhihu_author.find_many(where={"is_following": True}, order_by={"updated_at": "desc"})
-        stats = {"new_answers": 0, "new_articles": 0, "new_pins": 0}
-        for author in authors:
-            result = run_today_updates(author.profile_url, profile_dir=profile_dir)
-            stats["new_answers"] += int(result.get("new_answers", 0))
-            stats["new_articles"] += int(result.get("new_articles", 0))
-            stats["new_pins"] += int(result.get("new_pins", 0))
+        stats: dict[str, object] = {"new_answers": 0, "new_articles": 0, "new_pins": 0, "failed_authors": []}
+        total = len(authors)
+        for idx, author in enumerate(authors, start=1):
+            start = time.monotonic()
+            print(f"知乎检查进度 {idx}/{total}: {author.name} {author.profile_url}", flush=True)
+            try:
+                result = run_today_updates(author.profile_url, profile_dir=profile_dir)
+            except Exception as error:
+                traceback.print_exc()
+                failed_authors = stats["failed_authors"]
+                if not isinstance(failed_authors, list):
+                    raise RuntimeError("failed_authors 状态错误")
+                failed_authors.append(
+                    {
+                        "slug": author.slug,
+                        "name": author.name,
+                        "profile_url": author.profile_url,
+                        "error": str(error),
+                    }
+                )
+                elapsed = time.monotonic() - start
+                print(f"知乎检查失败 {idx}/{total}: {author.name} 用时 {elapsed:.1f}s error={error}", flush=True)
+                sleep_random()
+                continue
+
+            stats["new_answers"] = int(stats["new_answers"]) + int(result.get("new_answers", 0))
+            stats["new_articles"] = int(stats["new_articles"]) + int(result.get("new_articles", 0))
+            stats["new_pins"] = int(stats["new_pins"]) + int(result.get("new_pins", 0))
+            elapsed = time.monotonic() - start
+            print(
+                f"知乎检查完成 {idx}/{total}: {author.name} 用时 {elapsed:.1f}s "
+                f"新增回答 {int(result.get('new_answers', 0))} "
+                f"新增文章 {int(result.get('new_articles', 0))} "
+                f"新增想法 {int(result.get('new_pins', 0))}",
+                flush=True,
+            )
             sleep_random()
         return stats
     finally:
@@ -982,35 +1060,36 @@ def sync_zhihu(profile_url: str = DEFAULT_PROFILE_URL, profile_dir: Path = DEFAU
 
 
 def refresh_following(profile_url: str = DEFAULT_PROFILE_URL, profile_dir: Path = DEFAULT_PROFILE_DIR, signin_url: str = DEFAULT_SIGNIN_URL, login_wait: int = 300) -> dict[str, int]:
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    previous_display = subprocess.os.environ.get("DISPLAY")
-    previous_xauthority = subprocess.os.environ.get("XAUTHORITY")
-    subprocess.os.environ["DISPLAY"] = DEFAULT_X_DISPLAY
-    subprocess.os.environ["XAUTHORITY"] = DEFAULT_XAUTHORITY
-    context = launch_persistent_context(profile_dir, headless=False, locale="zh-CN", timezone="Asia/Shanghai", humanize=True, viewport={"width": 1280, "height": 900})
-    client = Client()
-    try:
-        authors_before = client.zhihu_author.find_many()
-        following_before = {author.slug for author in authors_before if author.is_following}
-        page = context.new_page()
-        users = sync_following(client, page, profile_url, signin_url, login_wait)
-        following_after = {user["slug"] for user in users}
-        return {
-            "following_count": len(users),
-            "added_count": len(following_after - following_before),
-            "removed_count": len(following_before - following_after),
-            "reactivated_count": len(
-                {
-                    user["slug"]
-                    for user in users
-                    if user["slug"] not in following_before
-                    and any(author.slug == user["slug"] for author in authors_before)
-                }
-            ),
-        }
-    finally:
-        Client.close_all()
-        context.close()
+    with zhihu_browser_lock():
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        previous_display = subprocess.os.environ.get("DISPLAY")
+        previous_xauthority = subprocess.os.environ.get("XAUTHORITY")
+        subprocess.os.environ["DISPLAY"] = DEFAULT_X_DISPLAY
+        subprocess.os.environ["XAUTHORITY"] = DEFAULT_XAUTHORITY
+        context = launch_persistent_context(profile_dir, headless=False, locale="zh-CN", timezone="Asia/Shanghai", humanize=True, viewport={"width": 1280, "height": 900})
+        client = Client()
+        try:
+            authors_before = client.zhihu_author.find_many()
+            following_before = {author.slug for author in authors_before if author.is_following}
+            page = context.new_page()
+            users = sync_following(client, page, profile_url, signin_url, login_wait)
+            following_after = {user["slug"] for user in users}
+            return {
+                "following_count": len(users),
+                "added_count": len(following_after - following_before),
+                "removed_count": len(following_before - following_after),
+                "reactivated_count": len(
+                    {
+                        user["slug"]
+                        for user in users
+                        if user["slug"] not in following_before
+                        and any(author.slug == user["slug"] for author in authors_before)
+                    }
+                ),
+            }
+        finally:
+            Client.close_all()
+            context.close()
         if previous_display is None:
             subprocess.os.environ.pop("DISPLAY", None)
         else:
@@ -1128,6 +1207,43 @@ def create_zhihu_task(
         Client.close_all()
 
 
+def cleanup_stale_running_zhihu_tasks(
+    *,
+    task_types: tuple[str, ...] | None = None,
+    older_than: timedelta = STALE_RUNNING_TASK_TIMEOUT,
+    error: str = "任务进程已结束，自动收敛陈旧 running 状态",
+) -> int:
+    now_local = datetime.now().astimezone().isoformat()
+    cutoff = (datetime.now().astimezone() - older_than).isoformat()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        params: list[object] = [cutoff]
+        where = "status = 'running' AND COALESCE(started_at, requested_at) <= ?"
+        if task_types:
+            placeholders = ", ".join("?" for _ in task_types)
+            where += f" AND task_type IN ({placeholders})"
+            params.extend(task_types)
+        rows = conn.execute(f"SELECT id FROM ZhihuTask WHERE {where}", params).fetchall()
+        if not rows:
+            conn.commit()
+            return 0
+        task_ids = [int(row[0]) for row in rows]
+        id_placeholders = ", ".join("?" for _ in task_ids)
+        conn.execute(
+            f"""
+            UPDATE ZhihuTask
+            SET status = 'failed',
+                finished_at = ?,
+                error = ?,
+                updated_at = ?
+            WHERE id IN ({id_placeholders})
+            """,
+            [now_local, error, now_local, *task_ids],
+        )
+        conn.commit()
+        return len(task_ids)
+
+
 def update_zhihu_task(
     task_id: int,
     *,
@@ -1159,20 +1275,48 @@ def update_zhihu_task(
         Client.close_all()
 
 
+def _claim_next_pending_zhihu_task_id() -> int | None:
+    started_at = datetime.now().astimezone().isoformat()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        while True:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT id
+                FROM ZhihuTask
+                WHERE status = 'pending'
+                ORDER BY requested_at ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            task_id = int(row[0])
+            cursor = conn.execute(
+                """
+                UPDATE ZhihuTask
+                SET status = 'running',
+                    started_at = ?,
+                    updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (started_at, started_at, task_id),
+            )
+            conn.commit()
+            if cursor.rowcount == 1:
+                return task_id
+
+
 def claim_next_pending_zhihu_task() -> dict[str, object] | None:
     client = Client()
     try:
-        task = client.zhihu_task.find_first(where={"status": "pending"}, order_by={"requested_at": "asc"})
-        if task is None:
+        task_id = _claim_next_pending_zhihu_task_id()
+        if task_id is None:
             return None
-        started_at = datetime.now().astimezone()
-        client.zhihu_task.update(
-            where={"id": task.id},
-            data={"status": "running", "started_at": started_at, "updated_at": started_at},
-        )
-        claimed = client.zhihu_task.find_first(where={"id": task.id})
+        claimed = client.zhihu_task.find_first(where={"id": task_id})
         if claimed is None:
-            raise RuntimeError(f"知乎任务不存在: {task.id}")
+            raise RuntimeError(f"知乎任务不存在: {task_id}")
         return _task_to_payload(claimed)
     finally:
         Client.close_all()
@@ -1187,14 +1331,14 @@ def read_latest_zhihu_task() -> dict[str, object] | None:
         Client.close_all()
 
 
-def read_latest_auto_check_finished_at() -> datetime | None:
+def read_latest_auto_check_task() -> dict[str, object] | None:
     client = Client()
     try:
         task = client.zhihu_task.find_first(
-            where={"task_type": "auto_check_new", "status": "done"},
-            order_by={"finished_at": "desc"},
+            where={"task_type": "auto_check_new"},
+            order_by={"requested_at": "desc"},
         )
-        return None if task is None else task.finished_at
+        return None if task is None else _task_to_payload(task)
     finally:
         Client.close_all()
 

@@ -1,7 +1,6 @@
 import json
 import os
 import sqlite3
-from datetime import time as dt_time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,7 +11,15 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from db_model import Article, DB_PATH
-from zhihu_sync import create_zhihu_task, refresh_following, run_today_updates, update_zhihu_task
+from zhihu_sync import (
+    DEFAULT_REQUEST_PROFILE_URL,
+    cleanup_stale_running_zhihu_tasks,
+    create_zhihu_task,
+    refresh_following,
+    run_today_updates,
+    sync_zhihu,
+    update_zhihu_task,
+)
 
 app = FastAPI(title="wechat-parser")
 
@@ -57,6 +64,24 @@ def _zhihu_task_to_dict(task) -> dict[str, object]:
 def _latest_zhihu_task_by_type(client: Client, task_type: str) -> dict[str, object] | None:
     task = client.zhihu_task.find_first(where={"task_type": task_type}, order_by={"id": "desc"})
     return None if task is None else _zhihu_task_to_dict(task)
+
+
+def _zhihu_task_sort_key(task: dict[str, object] | None) -> tuple[float, int]:
+    if task is None:
+        return (0.0, 0)
+    for key in ("started_at", "requested_at", "finished_at"):
+        value = task.get(key)
+        if isinstance(value, str) and value:
+            return (datetime.fromisoformat(value).timestamp(), int(task.get("id") or 0))
+    return (0.0, int(task.get("id") or 0))
+
+
+def _latest_zhihu_check_task(client: Client) -> dict[str, object] | None:
+    tasks = [
+        _latest_zhihu_task_by_type(client, "check_new"),
+        _latest_zhihu_task_by_type(client, "auto_check_new"),
+    ]
+    return max(tasks, key=_zhihu_task_sort_key)
 
 
 def _zhihu_latest_publish_sort_key(item: dict[str, object]) -> tuple[int, float]:
@@ -437,7 +462,9 @@ def api_stats():
 
 @app.get("/api/zhihu/stats")
 def api_zhihu_stats():
+    cleanup_stale_running_zhihu_tasks(task_types=("check_new", "auto_check_new"))
     db = _db()
+    client = Client()
     try:
         total_following = db.execute("SELECT COUNT(*) FROM ZhihuAuthor WHERE is_following = 1").fetchone()[0]
         answer_authors = db.execute("SELECT COUNT(DISTINCT author_id) FROM ZhihuAnswer").fetchone()[0]
@@ -464,20 +491,14 @@ def api_zhihu_stats():
             WHERE date(first_seen_at) = date('now', 'localtime')
             """
         ).fetchone()[0]
-        last_check = db.execute(
-            """
-            SELECT MAX(last_seen_at)
-            FROM (
-                SELECT last_seen_at FROM ZhihuAuthor
-                UNION ALL
-                SELECT last_seen_at FROM ZhihuAnswer
-                UNION ALL
-                SELECT last_seen_at FROM ZhihuArticle
-                UNION ALL
-                SELECT last_seen_at FROM ZhihuPin
+        last_check_task = _latest_zhihu_check_task(client)
+        last_check = None
+        if last_check_task is not None:
+            last_check = (
+                last_check_task.get("started_at")
+                or last_check_task.get("requested_at")
+                or last_check_task.get("finished_at")
             )
-            """
-        ).fetchone()[0]
         return {
             "total_following": total_following,
             "answer_authors": answer_authors,
@@ -486,9 +507,11 @@ def api_zhihu_stats():
             "total_contents": total_contents,
             "today_new": today_new,
             "last_check": last_check,
+            "last_check_task": last_check_task,
         }
     finally:
         db.close()
+        Client.close_all()
 
 
 @app.get("/api/zhihu/today")
@@ -692,15 +715,32 @@ def api_zhihu_refresh_following():
 
 @app.post("/api/zhihu/check-new")
 def api_zhihu_check_new():
-    now_local = datetime.now().astimezone().time()
-    if now_local < dt_time(8, 0) or now_local >= dt_time(23, 0):
-        return {"ok": True, "skipped": True}
-    payload = create_zhihu_task("check_new")
-    return {"ok": True, "queued": True, **payload}
+    cleanup_stale_running_zhihu_tasks(task_types=("check_new", "auto_check_new"))
+    task = create_zhihu_task("check_new", profile_url=DEFAULT_REQUEST_PROFILE_URL, status="running", started_at=datetime.now().astimezone())
+    try:
+        result = sync_zhihu(profile_url=DEFAULT_REQUEST_PROFILE_URL)
+        update_zhihu_task(
+            int(task["id"]),
+            status="done",
+            finished_at=datetime.now().astimezone(),
+            result_payload=result,
+        )
+    except Exception as error:
+        update_zhihu_task(int(task["id"]), status="failed", finished_at=datetime.now().astimezone(), error=str(error))
+        raise HTTPException(status_code=500, detail=str(error)) from error
+    return {
+        "ok": True,
+        "new_items_count": int(result.get("new_answers", 0)) + int(result.get("new_articles", 0)) + int(result.get("new_pins", 0)),
+        "new_answers": int(result.get("new_answers", 0)),
+        "new_articles": int(result.get("new_articles", 0)),
+        "new_pins": int(result.get("new_pins", 0)),
+        **result,
+    }
 
 
 @app.get("/api/zhihu/sync-status")
 def api_zhihu_sync_status():
+    cleanup_stale_running_zhihu_tasks(task_types=("check_new", "auto_check_new"))
     client = Client()
     try:
         latest_task = client.zhihu_task.find_first(order_by={"id": "desc"})
@@ -712,6 +752,7 @@ def api_zhihu_sync_status():
             "latest_task": _zhihu_task_to_dict(latest_task),
             "latest_check_new": _latest_zhihu_task_by_type(client, "check_new"),
             "latest_auto_check_new": _latest_zhihu_task_by_type(client, "auto_check_new"),
+            "latest_check_task": _latest_zhihu_check_task(client),
             "latest_refresh_following": _latest_zhihu_task_by_type(client, "refresh_following"),
             "latest_refresh_profile": _latest_zhihu_task_by_type(client, "refresh_profile"),
         }

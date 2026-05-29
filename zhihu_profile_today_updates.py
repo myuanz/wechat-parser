@@ -13,6 +13,7 @@ DEFAULT_SIGNIN_URL = "https://www.zhihu.com/signin"
 DEFAULT_PROFILE_DIR = Path(__file__).with_name("browser_profiles") / "zhihu"
 DEFAULT_OUTPUT = Path("/srv/samba/share") / "zhihu_profile_today_updates.json"
 DEFAULT_LIMIT = 30
+FETCH_TIMEOUT_MS = 30_000
 
 
 def profile_slug(profile_url: str) -> str:
@@ -37,6 +38,16 @@ def wait_for_login(page, signin_url: str, seconds: int) -> None:
             return
         page.wait_for_timeout(1000)
     raise RuntimeError("知乎仍在登录页，请先在打开的浏览器里完成登录")
+
+
+def goto_profile(page, profile_url: str, signin_url: str, login_wait: int) -> None:
+    page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
+    if not is_login_page(page):
+        return
+    wait_for_login(page, signin_url, login_wait)
+    page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
+    if is_login_page(page):
+        raise RuntimeError("登录后仍然被重定向到登录页，请确认账号已完成登录")
 
 
 def html_to_text(html: str) -> str:
@@ -104,7 +115,7 @@ def is_today_timestamp(timestamp: object, start_dt: datetime) -> bool:
 def fetch_answers_payload(page, slug: str, limit: int) -> dict[str, object]:
     payload = page.evaluate(
         """
-        async ({ slug, limit }) => {
+        async ({ slug, limit, timeoutMs }) => {
           const include = [
             "data[*].is_normal",
             "admin_closed_comment",
@@ -145,15 +156,22 @@ def fetch_answers_payload(page, slug: str, limit: int) -> dict[str, object]:
             "relationship"
           ].join(",");
           const url = `https://www.zhihu.com/api/v4/members/${slug}/answers?include=${include}&offset=0&limit=${limit}&sort_by=created&ws_qiangzhisafe=0`;
-          const response = await fetch(url, {
-            credentials: "include",
-            headers: { "accept": "application/json, text/plain, */*" }
-          });
-          if (!response.ok) throw new Error(`抓取回答列表失败: ${response.status} ${response.statusText}`);
-          return { url, payload: await response.json() };
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const response = await fetch(url, {
+              credentials: "include",
+              headers: { "accept": "application/json, text/plain, */*" },
+              signal: controller.signal
+            });
+            if (!response.ok) throw new Error(`抓取回答列表失败: ${response.status} ${response.statusText}`);
+            return { url, payload: await response.json() };
+          } finally {
+            clearTimeout(timer);
+          }
         }
         """,
-        {"slug": slug, "limit": limit},
+        {"slug": slug, "limit": limit, "timeoutMs": FETCH_TIMEOUT_MS},
     )
     if not isinstance(payload, dict):
         raise RuntimeError("回答接口返回格式不对")
@@ -163,7 +181,7 @@ def fetch_answers_payload(page, slug: str, limit: int) -> dict[str, object]:
 def fetch_answer_detail(page, answer_id: str) -> dict[str, object]:
     payload = page.evaluate(
         """
-        async (answerId) => {
+        async ({ answerId, timeoutMs }) => {
           const include = [
             "content",
             "voteup_count",
@@ -176,15 +194,22 @@ def fetch_answer_detail(page, answer_id: str) -> dict[str, object]:
             "question"
           ].join(",");
           const url = `https://www.zhihu.com/api/v4/answers/${answerId}?include=${include}`;
-          const response = await fetch(url, {
-            credentials: "include",
-            headers: { "accept": "application/json, text/plain, */*" }
-          });
-          if (!response.ok) throw new Error(`抓取回答详情失败: ${response.status} ${response.statusText}`);
-          return await response.json();
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const response = await fetch(url, {
+              credentials: "include",
+              headers: { "accept": "application/json, text/plain, */*" },
+              signal: controller.signal
+            });
+            if (!response.ok) throw new Error(`抓取回答详情失败: ${response.status} ${response.statusText}`);
+            return await response.json();
+          } finally {
+            clearTimeout(timer);
+          }
         }
         """,
-        answer_id,
+        {"answerId": answer_id, "timeoutMs": FETCH_TIMEOUT_MS},
     )
     if not isinstance(payload, dict):
         raise RuntimeError(f"回答详情格式不对: {answer_id}")
@@ -194,7 +219,7 @@ def fetch_answer_detail(page, answer_id: str) -> dict[str, object]:
 def fetch_articles_payload(page, slug: str, limit: int) -> dict[str, object]:
     payload = page.evaluate(
         """
-        async ({ slug, limit }) => {
+        async ({ slug, limit, timeoutMs }) => {
           const include = [
             "data[*].comment_count",
             "suggest_edit",
@@ -221,15 +246,22 @@ def fetch_articles_payload(page, slug: str, limit: int) -> dict[str, object]:
             "data[*].author.vip_info"
           ].join(",");
           const url = `https://www.zhihu.com/api/v4/members/${slug}/articles?include=${include}&offset=0&limit=${limit}&sort_by=created&ws_qiangzhisafe=0`;
-          const response = await fetch(url, {
-            credentials: "include",
-            headers: { "accept": "application/json, text/plain, */*" }
-          });
-          if (!response.ok) throw new Error(`抓取文章列表失败: ${response.status} ${response.statusText}`);
-          return { url, payload: await response.json() };
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const response = await fetch(url, {
+              credentials: "include",
+              headers: { "accept": "application/json, text/plain, */*" },
+              signal: controller.signal
+            });
+            if (!response.ok) throw new Error(`抓取文章列表失败: ${response.status} ${response.statusText}`);
+            return { url, payload: await response.json() };
+          } finally {
+            clearTimeout(timer);
+          }
         }
         """,
-        {"slug": slug, "limit": limit},
+        {"slug": slug, "limit": limit, "timeoutMs": FETCH_TIMEOUT_MS},
     )
     if not isinstance(payload, dict):
         raise RuntimeError("文章接口返回格式不对")
@@ -239,17 +271,24 @@ def fetch_articles_payload(page, slug: str, limit: int) -> dict[str, object]:
 def fetch_pins_payload(page, slug: str, limit: int) -> dict[str, object]:
     payload = page.evaluate(
         """
-        async ({ slug, limit }) => {
+        async ({ slug, limit, timeoutMs }) => {
           const url = `https://www.zhihu.com/api/v4/v2/members/${slug}/pins?offset=0&limit=${limit}`;
-          const response = await fetch(url, {
-            credentials: "include",
-            headers: { "accept": "application/json, text/plain, */*" }
-          });
-          if (!response.ok) throw new Error(`抓取想法列表失败: ${response.status} ${response.statusText}`);
-          return { url, payload: await response.json() };
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const response = await fetch(url, {
+              credentials: "include",
+              headers: { "accept": "application/json, text/plain, */*" },
+              signal: controller.signal
+            });
+            if (!response.ok) throw new Error(`抓取想法列表失败: ${response.status} ${response.statusText}`);
+            return { url, payload: await response.json() };
+          } finally {
+            clearTimeout(timer);
+          }
         }
         """,
-        {"slug": slug, "limit": limit},
+        {"slug": slug, "limit": limit, "timeoutMs": FETCH_TIMEOUT_MS},
     )
     if not isinstance(payload, dict):
         raise RuntimeError("想法接口返回格式不对")
@@ -615,10 +654,7 @@ def collect_today_updates(
     )
     try:
         page = context.new_page()
-        wait_for_login(page, signin_url, login_wait)
-        page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
-        if is_login_page(page):
-            raise RuntimeError("登录后仍然被重定向到登录页，请确认账号已完成登录")
+        goto_profile(page, profile_url, signin_url, login_wait)
         page.wait_for_timeout(3_000)
 
         api_urls: dict[str, str] = {}

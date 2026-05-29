@@ -117,6 +117,7 @@ let zhihuSelectedItemIdx = null;
 let zhihuTodayRequestSeq = 0;
 let zhihuRefreshInFlight = false;
 let zhihuFollowingRefreshInFlight = false;
+let zhihuCheckInFlight = false;
 let zhihuFollowingStatusTimer = null;
 
 function h(s) {
@@ -191,6 +192,15 @@ function fmtTime(iso) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+function zhihuCheckStatusText(task) {
+  if (!task) return '-';
+  if (task.status === 'running') return '进行中';
+  if (task.status === 'done') return '成功';
+  if (task.status === 'failed') return task.error ? `失败: ${task.error}` : '失败';
+  if (task.status === 'pending') return '排队中';
+  return task.status || '-';
+}
+
 function switchView(view) {
   currentView = view;
   $('#tab-wechat').classList.toggle('active', view === 'wechat');
@@ -218,7 +228,7 @@ function switchView(view) {
     回答作者 <strong id="zh-answer-authors">-</strong> 个<br>
     已收录内容 <strong id="zh-total-contents">-</strong> 条<br>
     今日新增 <strong id="zh-today-new">-</strong> 条
-    <span class="summary-actions"><button type="button" onclick="checkZhihuNew()">检查新内容</button></span><br>
+    <span class="summary-actions"><button id="zhihu-check-new-btn" type="button" onclick="checkZhihuNew()">检查新内容</button></span><span id="zhihu-check-new-status" class="summary-status"></span><br>
     <span style="font-size:10px">上次检查 <span id="zh-last-check">-</span></span>`;
   $('#account-list').innerHTML = '<div class="loading">知乎关注列表稍后接入</div>';
   $('#center-title').textContent = '知乎今日更新';
@@ -237,7 +247,9 @@ async function loadZhihuStats() {
   $('#zh-answer-authors').textContent = s.answer_authors;
   $('#zh-total-contents').textContent = s.total_contents;
   $('#zh-today-new').textContent = s.today_new;
-  $('#zh-last-check').textContent = fmtTime(s.last_check);
+  $('#zh-last-check').textContent = s.last_check_task
+    ? `${fmtTime(s.last_check)} (${zhihuCheckStatusText(s.last_check_task)})`
+    : fmtTime(s.last_check);
   await loadZhihuFollowings();
   await loadZhihuToday();
 }
@@ -417,10 +429,31 @@ async function refreshZhihuFollowing() {
 }
 
 async function checkZhihuNew() {
-  const resp = await fetch('/api/zhihu/check-new', { method: 'POST' });
-  const data = await resp.json();
-  console.log('zhihu check queued', data);
-  await loadZhihuStats();
+  if (zhihuCheckInFlight) return;
+  zhihuCheckInFlight = true;
+  const checkBtn = $('#zhihu-check-new-btn');
+  const statusEl = $('#zhihu-check-new-status');
+  if (checkBtn) checkBtn.disabled = true;
+  if (statusEl) statusEl.textContent = '检查中...';
+  try {
+    const resp = await fetch('/api/zhihu/check-new', { method: 'POST' });
+    const data = await resp.json();
+    console.log('zhihu check finished', data);
+    if (!resp.ok) {
+      throw new Error(data.detail || '检查失败');
+    }
+    if (statusEl) {
+      const itemCount = typeof data.new_items_count === 'number' ? data.new_items_count : 0;
+      statusEl.textContent = itemCount ? `本次新增 ${itemCount} 条` : '无新增';
+    }
+    await loadZhihuStats();
+  } catch (error) {
+    if (statusEl) statusEl.textContent = '检查失败';
+    console.error('zhihu check failed', error);
+  } finally {
+    zhihuCheckInFlight = false;
+    if (checkBtn) checkBtn.disabled = false;
+  }
 }
 
 async function loadAccounts() {
