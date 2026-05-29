@@ -242,3 +242,26 @@ class ZhihuArticle:
 
     def foreign_key(self):
         yield self.author.id == self.author_id, ZhihuAuthor.articles
+
+
+@dataclass
+class ZhihuTask:
+    id: int
+    task_type: str
+    profile_url: str
+    status: str
+    requested_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    request_payload_json: str | None
+    result_payload_json: str | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    def index(self):
+        yield self.task_type
+        yield self.status
+        yield self.requested_at
+        yield self.finished_at
+        yield self.updated_at

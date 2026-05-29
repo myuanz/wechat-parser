@@ -18,8 +18,6 @@ from zhihu_profile_today_updates import collect_today_updates
 DEFAULT_PROFILE_DIR = Path(__file__).with_name("browser_profiles") / "zhihu"
 DEFAULT_SIGNIN_URL = "https://www.zhihu.com/signin"
 DEFAULT_PROFILE_URL = "https://www.zhihu.com/people/bu-ye-cheng-76"
-DEFAULT_RESULT_PATH = Path(__file__).with_name("dumps") / "zhihu_sync_result.json"
-DEFAULT_REQUEST_PATH = Path(__file__).with_name("dumps") / "zhihu_sync_request.json"
 DEFAULT_FOLLOWING_DEBUG_PATH = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
 DEFAULT_LIMIT = 20
 DEFAULT_CONTENT_LIMIT = 1
@@ -1059,46 +1057,152 @@ def sync_single_author(
         Client.close_all()
 
 
-def write_sync_request(action: str, profile_url: str = DEFAULT_REQUEST_PROFILE_URL, **extra: object) -> dict[str, object]:
-    DEFAULT_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _dump_json(payload: dict[str, object] | None) -> str | None:
+    if payload is None:
+        return None
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _load_json(payload_json: str | None) -> dict[str, object]:
+    if not payload_json:
+        return {}
+    payload = json.loads(payload_json)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _dt_iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _normalize_task_type(task_type: str) -> str:
+    return task_type.strip().replace("-", "_")
+
+
+def _task_to_payload(task) -> dict[str, object]:
     payload = {
-        "action": action,
-        "profile_url": profile_url,
-        "requested_at": datetime.now().astimezone().isoformat(),
-        "status": "pending",
-        **extra,
+        "id": task.id,
+        "task_type": task.task_type,
+        "profile_url": task.profile_url,
+        "status": task.status,
+        "requested_at": _dt_iso(task.requested_at),
+        "started_at": _dt_iso(task.started_at),
+        "finished_at": _dt_iso(task.finished_at),
+        "error": task.error,
     }
-    DEFAULT_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload.update(_load_json(task.request_payload_json))
+    payload.update(_load_json(task.result_payload_json))
     return payload
 
 
-def read_sync_request() -> dict[str, object] | None:
-    if not DEFAULT_REQUEST_PATH.exists():
-        return None
-    return json.loads(DEFAULT_REQUEST_PATH.read_text(encoding="utf-8"))
+def create_zhihu_task(
+    task_type: str,
+    profile_url: str = DEFAULT_REQUEST_PROFILE_URL,
+    *,
+    status: str = "pending",
+    request_payload: dict[str, object] | None = None,
+    started_at: datetime | None = None,
+    finished_at: datetime | None = None,
+    result_payload: dict[str, object] | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    client = Client()
+    try:
+        now_local = datetime.now().astimezone()
+        task = client.zhihu_task.insert(
+            {
+                "task_type": _normalize_task_type(task_type),
+                "profile_url": profile_url,
+                "status": status,
+                "requested_at": now_local,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "request_payload_json": _dump_json(request_payload),
+                "result_payload_json": _dump_json(result_payload),
+                "error": error,
+                "created_at": now_local,
+                "updated_at": now_local,
+            }
+        )
+        return _task_to_payload(task)
+    finally:
+        Client.close_all()
 
 
-def clear_sync_request() -> None:
-    if DEFAULT_REQUEST_PATH.exists():
-        DEFAULT_REQUEST_PATH.unlink()
+def update_zhihu_task(
+    task_id: int,
+    *,
+    status: str | None = None,
+    started_at: datetime | None = None,
+    finished_at: datetime | None = None,
+    result_payload: dict[str, object] | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    client = Client()
+    try:
+        data: dict[str, object] = {"updated_at": datetime.now().astimezone()}
+        if status is not None:
+            data["status"] = status
+        if started_at is not None or status == "running":
+            data["started_at"] = started_at
+        if finished_at is not None or status in {"done", "failed"}:
+            data["finished_at"] = finished_at
+        if result_payload is not None:
+            data["result_payload_json"] = _dump_json(result_payload)
+        if error is not None or status == "done":
+            data["error"] = error
+        client.zhihu_task.update(where={"id": task_id}, data=data)
+        task = client.zhihu_task.find_first(where={"id": task_id})
+        if task is None:
+            raise RuntimeError(f"知乎任务不存在: {task_id}")
+        return _task_to_payload(task)
+    finally:
+        Client.close_all()
 
 
-def write_sync_result(payload: dict[str, object]) -> dict[str, object]:
-    DEFAULT_RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DEFAULT_RESULT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
+def claim_next_pending_zhihu_task() -> dict[str, object] | None:
+    client = Client()
+    try:
+        task = client.zhihu_task.find_first(where={"status": "pending"}, order_by={"requested_at": "asc"})
+        if task is None:
+            return None
+        started_at = datetime.now().astimezone()
+        client.zhihu_task.update(
+            where={"id": task.id},
+            data={"status": "running", "started_at": started_at, "updated_at": started_at},
+        )
+        claimed = client.zhihu_task.find_first(where={"id": task.id})
+        if claimed is None:
+            raise RuntimeError(f"知乎任务不存在: {task.id}")
+        return _task_to_payload(claimed)
+    finally:
+        Client.close_all()
 
 
-def read_sync_result() -> dict[str, object] | None:
-    if not DEFAULT_RESULT_PATH.exists():
-        return None
-    return json.loads(DEFAULT_RESULT_PATH.read_text(encoding="utf-8"))
+def read_latest_zhihu_task() -> dict[str, object] | None:
+    client = Client()
+    try:
+        task = client.zhihu_task.find_first(order_by={"id": "desc"})
+        return None if task is None else _task_to_payload(task)
+    finally:
+        Client.close_all()
+
+
+def read_latest_auto_check_finished_at() -> datetime | None:
+    client = Client()
+    try:
+        task = client.zhihu_task.find_first(
+            where={"task_type": "auto_check_new", "status": "done"},
+            order_by={"finished_at": "desc"},
+        )
+        return None if task is None else task.finished_at
+    finally:
+        Client.close_all()
 
 
 def cli_main() -> None:
     parser = argparse.ArgumentParser(description="知乎同步")
     parser.add_argument("--run-once", action="store_true")
-    parser.add_argument("--action", default="refresh-following")
+    parser.add_argument("--action", default="refresh_following")
     parser.add_argument("--profile-url", default=DEFAULT_PROFILE_URL)
     parser.add_argument("--profile-dir", type=Path, default=DEFAULT_PROFILE_DIR)
     parser.add_argument("--limit", type=int, default=100)
@@ -1106,21 +1210,24 @@ def cli_main() -> None:
     args = parser.parse_args()
     if not args.run_once:
         raise SystemExit("目前只支持 --run-once")
-    if args.action == "backfill-empty-answer-content":
-        result = backfill_empty_answer_contents(profile_url=args.profile_url, profile_dir=args.profile_dir, limit=args.limit)
-    elif args.action == "repair-answer-authors":
-        result = repair_answer_authors(profile_url=args.profile_url, profile_dir=args.profile_dir, limit=args.limit, author_slug=args.author_slug)
-    else:
-        result = sync_zhihu(profile_url=args.profile_url, profile_dir=args.profile_dir)
-    write_sync_result(
-        {
-            "action": args.action,
-            "profile_url": args.profile_url,
-            "finished_at": datetime.now().astimezone().isoformat(),
-            "status": "done",
-            **result,
-        }
-    )
+    action = _normalize_task_type(args.action)
+    task = create_zhihu_task(action, profile_url=args.profile_url, status="running", started_at=datetime.now().astimezone())
+    try:
+        if action == "backfill_empty_answer_content":
+            result = backfill_empty_answer_contents(profile_url=args.profile_url, profile_dir=args.profile_dir, limit=args.limit)
+        elif action == "repair_answer_authors":
+            result = repair_answer_authors(profile_url=args.profile_url, profile_dir=args.profile_dir, limit=args.limit, author_slug=args.author_slug)
+        else:
+            result = sync_zhihu(profile_url=args.profile_url, profile_dir=args.profile_dir)
+        update_zhihu_task(
+            int(task["id"]),
+            status="done",
+            finished_at=datetime.now().astimezone(),
+            result_payload=result,
+        )
+    except Exception as error:
+        update_zhihu_task(int(task["id"]), status="failed", finished_at=datetime.now().astimezone(), error=str(error))
+        raise
 
 
 if __name__ == "__main__":

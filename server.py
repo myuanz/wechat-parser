@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from datetime import time as dt_time
@@ -11,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from db_model import Article, DB_PATH
-from zhihu_sync import read_sync_result, refresh_following, run_today_updates, write_sync_request
+from zhihu_sync import create_zhihu_task, refresh_following, run_today_updates, update_zhihu_task
 
 app = FastAPI(title="wechat-parser")
 
@@ -28,6 +29,34 @@ def _decompress(html_zstd: bytes | None) -> str | None:
 
 def _normalize_dt(value: str) -> str:
     return datetime.fromisoformat(value).isoformat()
+
+
+def _zhihu_task_payload_json(payload_json: str | None) -> dict[str, object]:
+    if not payload_json:
+        return {}
+    payload = json.loads(payload_json)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _zhihu_task_to_dict(task) -> dict[str, object]:
+    payload = {
+        "id": task.id,
+        "task_type": task.task_type,
+        "profile_url": task.profile_url,
+        "status": task.status,
+        "requested_at": task.requested_at.isoformat(),
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+        "error": task.error,
+    }
+    payload.update(_zhihu_task_payload_json(task.request_payload_json))
+    payload.update(_zhihu_task_payload_json(task.result_payload_json))
+    return payload
+
+
+def _latest_zhihu_task_by_type(client: Client, task_type: str) -> dict[str, object] | None:
+    task = client.zhihu_task.find_first(where={"task_type": task_type}, order_by={"id": "desc"})
+    return None if task is None else _zhihu_task_to_dict(task)
 
 
 def _zhihu_latest_publish_sort_key(item: dict[str, object]) -> tuple[int, float]:
@@ -621,9 +650,17 @@ def api_zhihu_following_refresh(slug: str = Query(...)):
     if row is None:
         raise HTTPException(status_code=404, detail="zhihu following not found")
     profile_url = str(row[0])
+    task = create_zhihu_task("refresh_profile", profile_url=profile_url, status="running", started_at=datetime.now().astimezone())
     try:
         result = run_today_updates(profile_url)
+        update_zhihu_task(
+            int(task["id"]),
+            status="done",
+            finished_at=datetime.now().astimezone(),
+            result_payload=result,
+        )
     except Exception as error:
+        update_zhihu_task(int(task["id"]), status="failed", finished_at=datetime.now().astimezone(), error=str(error))
         raise HTTPException(status_code=500, detail=str(error)) from error
     return {
         "ok": True,
@@ -638,9 +675,17 @@ def api_zhihu_following_refresh(slug: str = Query(...)):
 
 @app.post("/api/zhihu/refresh-following")
 def api_zhihu_refresh_following():
+    task = create_zhihu_task("refresh_following", status="running", started_at=datetime.now().astimezone())
     try:
         result = refresh_following()
+        update_zhihu_task(
+            int(task["id"]),
+            status="done",
+            finished_at=datetime.now().astimezone(),
+            result_payload=result,
+        )
     except Exception as error:
+        update_zhihu_task(int(task["id"]), status="failed", finished_at=datetime.now().astimezone(), error=str(error))
         raise HTTPException(status_code=500, detail=str(error)) from error
     return {"ok": True, **result}
 
@@ -650,16 +695,28 @@ def api_zhihu_check_new():
     now_local = datetime.now().astimezone().time()
     if now_local < dt_time(8, 0) or now_local >= dt_time(23, 0):
         return {"ok": True, "skipped": True}
-    payload = write_sync_request("check-new")
+    payload = create_zhihu_task("check_new")
     return {"ok": True, "queued": True, **payload}
 
 
 @app.get("/api/zhihu/sync-status")
 def api_zhihu_sync_status():
-    result = read_sync_result()
-    if result is None:
-        return {"ok": True, "status": "idle"}
-    return {"ok": True, **result}
+    client = Client()
+    try:
+        latest_task = client.zhihu_task.find_first(order_by={"id": "desc"})
+        if latest_task is None:
+            return {"ok": True, "status": "idle"}
+        return {
+            "ok": True,
+            "status": latest_task.status,
+            "latest_task": _zhihu_task_to_dict(latest_task),
+            "latest_check_new": _latest_zhihu_task_by_type(client, "check_new"),
+            "latest_auto_check_new": _latest_zhihu_task_by_type(client, "auto_check_new"),
+            "latest_refresh_following": _latest_zhihu_task_by_type(client, "refresh_following"),
+            "latest_refresh_profile": _latest_zhihu_task_by_type(client, "refresh_profile"),
+        }
+    finally:
+        Client.close_all()
 
 
 if __name__ == "__main__":
