@@ -19,7 +19,7 @@ DEFAULT_SIGNIN_URL = "https://www.zhihu.com/signin"
 DEFAULT_PROFILE_URL = "https://www.zhihu.com/people/bu-ye-cheng-76"
 DEFAULT_RESULT_PATH = Path(__file__).with_name("dumps") / "zhihu_sync_result.json"
 DEFAULT_REQUEST_PATH = Path(__file__).with_name("dumps") / "zhihu_sync_request.json"
-DEFAULT_FOLLOWING_SNAPSHOT = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
+DEFAULT_FOLLOWING_DEBUG_PATH = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
 DEFAULT_LIMIT = 20
 DEFAULT_CONTENT_LIMIT = 1
 DEFAULT_REQUEST_PROFILE_URL = "https://www.zhihu.com/people/bu-ye-cheng-76"
@@ -144,28 +144,19 @@ def fetch_following(page, profile_url: str, signin_url: str, login_wait: int) ->
     return [user for user in users if not should_skip_following_user(user)]
 
 
-def load_following_snapshot() -> list[dict[str, str]]:
-    if not DEFAULT_FOLLOWING_SNAPSHOT.exists():
-        return []
-    payload = json.loads(DEFAULT_FOLLOWING_SNAPSHOT.read_text(encoding="utf-8"))
-    users = payload.get("users")
-    if not isinstance(users, list):
-        return []
-    result: list[dict[str, str]] = []
-    for item in users:
-        if not isinstance(item, dict):
-            continue
-        user = {
-            "name": str(item.get("name") or ""),
-            "url": str(item.get("url") or ""),
-            "slug": str(item.get("slug") or ""),
-            "headline": str(item.get("headline") or ""),
-            "avatar": str(item.get("avatar") or ""),
-        }
-        if not user["slug"] or not user["url"] or should_skip_following_user(user):
-            continue
-        result.append(user)
-    return result
+def save_following_debug_dump(users: list[dict[str, str]]) -> None:
+    DEFAULT_FOLLOWING_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_FOLLOWING_DEBUG_PATH.write_text(
+        json.dumps(
+            {
+                "updated_at": datetime.now().astimezone().isoformat(),
+                "users": users,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def html_to_text(html: str) -> str:
@@ -324,9 +315,7 @@ def fetch_pin_candidates(page, slug: str) -> list[dict[str, object]]:
 
 def sync_following(client: Client, page, profile_url: str, signin_url: str, login_wait: int) -> list[dict[str, str]]:
     users = fetch_following(page, profile_url, signin_url, login_wait)
-    snapshot_users = load_following_snapshot()
-    if len(snapshot_users) > len(users):
-        users = snapshot_users
+    save_following_debug_dump(users)
     now_value = now()
     authors = client.zhihu_author.find_many()
     existing_by_url = {author.profile_url: author for author in authors}
@@ -1027,9 +1016,24 @@ def refresh_following(profile_url: str = DEFAULT_PROFILE_URL, profile_dir: Path 
     context = launch_persistent_context(profile_dir, headless=False, locale="zh-CN", timezone="Asia/Shanghai", humanize=True, viewport={"width": 1280, "height": 900})
     client = Client()
     try:
+        authors_before = client.zhihu_author.find_many()
+        following_before = {author.slug for author in authors_before if author.is_following}
         page = context.new_page()
         users = sync_following(client, page, profile_url, signin_url, login_wait)
-        return {"following_count": len(users)}
+        following_after = {user["slug"] for user in users}
+        return {
+            "following_count": len(users),
+            "added_count": len(following_after - following_before),
+            "removed_count": len(following_before - following_after),
+            "reactivated_count": len(
+                {
+                    user["slug"]
+                    for user in users
+                    if user["slug"] not in following_before
+                    and any(author.slug == user["slug"] for author in authors_before)
+                }
+            ),
+        }
     finally:
         Client.close_all()
         context.close()
@@ -1055,11 +1059,9 @@ def sync_single_author(
     client = Client()
     try:
         author = client.zhihu_author.find_first(where={"slug": author_slug})
-        snapshot_user = next((user for user in load_following_snapshot() if user["slug"] == author_slug), None)
         now_value = now()
         if author is None:
-            name = snapshot_user["name"] if snapshot_user is not None else author_slug
-            author = ensure_author_record(client, author_slug, name, now_value)
+            author = ensure_author_record(client, author_slug, author_slug, now_value)
         if author is None:
             raise RuntimeError(f"知乎作者不存在: {author_slug}")
         update_payload = {
@@ -1067,10 +1069,6 @@ def sync_single_author(
             "is_following": True,
             "updated_at": now_value,
         }
-        if snapshot_user is not None:
-            update_payload["name"] = snapshot_user["name"]
-            update_payload["headline"] = snapshot_user["headline"]
-            update_payload["avatar_url"] = snapshot_user["avatar"]
         client.zhihu_author.update(where={"id": author.id}, data=update_payload)
         author = client.zhihu_author.find_first(where={"id": author.id})
         if author is None:

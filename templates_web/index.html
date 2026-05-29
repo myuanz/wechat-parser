@@ -23,6 +23,7 @@
   .summary-actions { display: inline-flex; gap: 8px; margin-left: 8px; vertical-align: middle; }
   .summary-actions button { border: 1px solid #ddd; background: #fff; padding: 1px 6px; border-radius: 3px; cursor: pointer; font-size: 11px; color: #1a6feb; }
   .summary-actions button:hover { background: #f0f5ff; border-color: #1a6feb; }
+  .summary-actions button:disabled { color: #aaa; background: #f5f5f5; border-color: #ddd; cursor: default; }
   .summary-status { font-size: 11px; color: #999; margin-left: 8px; }
 
   .panel-left h3 { padding: 12px 16px; font-size: 14px; color: #666; border-bottom: 1px solid #eee; }
@@ -115,6 +116,8 @@ let zhihuSelectedFollowingIdx = null;
 let zhihuSelectedItemIdx = null;
 let zhihuTodayRequestSeq = 0;
 let zhihuRefreshInFlight = false;
+let zhihuFollowingRefreshInFlight = false;
+let zhihuFollowingStatusTimer = null;
 
 function h(s) {
   if (!s) return '';
@@ -211,7 +214,7 @@ function switchView(view) {
   zhihuSelectedItemIdx = null;
   $('#stats-bar').innerHTML = `
     共 <strong id="zh-total-following">-</strong> 个知乎关注
-    <span class="summary-actions"><button type="button" onclick="refreshZhihuFollowing()">刷新关注</button></span><br>
+    <span class="summary-actions"><button id="zhihu-refresh-following-btn" type="button" onclick="refreshZhihuFollowing()">刷新关注</button></span><span id="zhihu-refresh-following-status" class="summary-status"></span><br>
     回答作者 <strong id="zh-answer-authors">-</strong> 个<br>
     已收录内容 <strong id="zh-total-contents">-</strong> 条<br>
     今日新增 <strong id="zh-today-new">-</strong> 条
@@ -294,7 +297,11 @@ function currentZhihuProfileUrl() {
 }
 
 function setZhihuCenterTitle(name, statusText = '') {
-  $('#center-title').innerHTML = `${h(name)} <span class="summary-actions"><button id="zhihu-refresh-today-btn" type="button" onclick="refreshZhihuToday()">抓今日更新</button></span><span id="zhihu-refresh-status" class="summary-status">${h(statusText)}</span>`;
+  const profileUrl = currentZhihuProfileUrl();
+  const titleHtml = profileUrl
+    ? `<a href="${hAttr(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color:#1a6feb;text-decoration:none">${h(name)}</a>`
+    : h(name);
+  $('#center-title').innerHTML = `${titleHtml} <span class="summary-actions"><button id="zhihu-refresh-today-btn" type="button" onclick="refreshZhihuToday()">抓今日更新</button></span><span id="zhihu-refresh-status" class="summary-status">${h(statusText)}</span>`;
 }
 
 function setZhihuRefreshStatus(statusText = '') {
@@ -367,10 +374,46 @@ async function refreshZhihuToday() {
 }
 
 async function refreshZhihuFollowing() {
-  const resp = await fetch('/api/zhihu/refresh-following', { method: 'POST' });
-  const data = await resp.json();
-  console.log('zhihu refresh queued', data);
-  await loadZhihuStats();
+  if (zhihuFollowingRefreshInFlight) return;
+  zhihuFollowingRefreshInFlight = true;
+  const refreshBtn = $('#zhihu-refresh-following-btn');
+  const statusEl = $('#zhihu-refresh-following-status');
+  if (zhihuFollowingStatusTimer !== null) {
+    clearTimeout(zhihuFollowingStatusTimer);
+    zhihuFollowingStatusTimer = null;
+  }
+  if (refreshBtn) refreshBtn.disabled = true;
+  if (statusEl) statusEl.textContent = '刷新中...';
+  try {
+    const resp = await fetch('/api/zhihu/refresh-following', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.detail || '刷新失败');
+    }
+    await loadZhihuStats();
+    const added = typeof data.added_count === 'number' ? data.added_count : 0;
+    const removed = typeof data.removed_count === 'number' ? data.removed_count : 0;
+    const total = typeof data.following_count === 'number' ? data.following_count : 0;
+    if (statusEl) {
+      statusEl.textContent = `刷新完成：当前 ${total}，新增 ${added}，取消 ${removed}`;
+      zhihuFollowingStatusTimer = setTimeout(() => {
+        statusEl.textContent = '';
+        zhihuFollowingStatusTimer = null;
+      }, 15_000);
+    }
+  } catch (error) {
+    if (statusEl) {
+      statusEl.textContent = '刷新失败';
+      zhihuFollowingStatusTimer = setTimeout(() => {
+        statusEl.textContent = '';
+        zhihuFollowingStatusTimer = null;
+      }, 15_000);
+    }
+    console.error('zhihu refresh following failed', error);
+  } finally {
+    zhihuFollowingRefreshInFlight = false;
+    if (refreshBtn) refreshBtn.disabled = false;
+  }
 }
 
 async function checkZhihuNew() {

@@ -12,24 +12,24 @@ from cloakbrowser import launch_persistent_context
 DEFAULT_FOLLOWING_URL = "https://www.zhihu.com/people/bu-ye-cheng-76/following"
 DEFAULT_SIGNIN_URL = "https://www.zhihu.com/signin"
 DEFAULT_PROFILE_DIR = Path(__file__).with_name("browser_profiles") / "zhihu"
-DEFAULT_OUTPUT = Path("/srv/samba/share") / "zhihu_following_latest.json"
+DEFAULT_OUTPUT = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
 
 
-def normalize_people_url(href: str) -> str | None:
+def normalize_profile_url(href: str) -> str | None:
     url = urljoin("https://www.zhihu.com", href)
     parsed = urlparse(url)
     if parsed.netloc != "www.zhihu.com":
         return None
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) != 2 or parts[0] != "people":
+    if len(parts) != 2 or parts[0] not in {"people", "org"}:
         return None
-    return f"https://www.zhihu.com/people/{parts[1]}"
+    return f"https://www.zhihu.com/{parts[0]}/{parts[1]}"
 
 
 def extract_following(page) -> list[dict[str, str]]:
     rows = page.evaluate(
         """
-        () => Array.from(document.querySelectorAll('a[href*="/people/"]')).map((a) => {
+        () => Array.from(document.querySelectorAll('a[href*="/people/"], a[href*="/org/"]')).map((a) => {
           const card = a.closest('.List-item, .ContentItem, .UserItem, [class*="List-item"]') || a.parentElement;
           const name = (a.textContent || '').trim();
           const headlineEl = card && card.querySelector('.ContentItem-headline, .UserItem-headline, [class*="headline"]');
@@ -46,7 +46,7 @@ def extract_following(page) -> list[dict[str, str]]:
 
     users: dict[str, dict[str, str]] = {}
     for row in rows:
-        url = normalize_people_url(row["href"])
+        url = normalize_profile_url(row["href"])
         if url is None:
             continue
         name = row["name"].strip()
@@ -140,7 +140,7 @@ def collect_all_following(page) -> list[dict[str, str]]:
     page_no = 1
     while True:
         page.wait_for_timeout(1500)
-        page_users = extract_following(page)
+        page_users = scroll_to_end(page, max_idle_scrolls=5)
         for user in page_users:
             users[user["url"]] = user
         print(f"第 {page_no} 页，累计 {len(users)} 个关注用户", flush=True)
@@ -157,7 +157,7 @@ def collect_all_following(page) -> list[dict[str, str]]:
         page.wait_for_function(
             """
             (prev) => {
-              const urls = Array.from(document.querySelectorAll('a[href*="/people/"]'))
+              const urls = Array.from(document.querySelectorAll('a[href*="/people/"], a[href*="/org/"]'))
                 .map((a) => new URL(a.getAttribute('href'), location.href).href)
                 .join('|');
               return location.href + '|' + urls !== prev;
@@ -180,12 +180,7 @@ def save_users(users: list[dict[str, str]], output: Path, source_url: str) -> No
         "users": users,
     }
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    snapshot = output.with_name(f"zhihu_following_{stamp}.json")
-    snapshot.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"已保存 {len(users)} 个关注用户到 {output}", flush=True)
-    print(f"快照文件: {snapshot}", flush=True)
 
 
 def main() -> None:

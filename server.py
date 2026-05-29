@@ -1,6 +1,5 @@
 import os
 import sqlite3
-import json
 from datetime import time as dt_time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,10 +11,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from db_model import Article, DB_PATH
-from zhihu_sync import read_sync_result, run_today_updates, write_sync_request
+from zhihu_sync import read_sync_result, refresh_following, run_today_updates, write_sync_request
 
 app = FastAPI(title="wechat-parser")
-DEFAULT_FOLLOWING_SNAPSHOT = Path(__file__).with_name("dumps") / "zhihu_following_latest.json"
 
 
 def _db():
@@ -30,36 +28,6 @@ def _decompress(html_zstd: bytes | None) -> str | None:
 
 def _normalize_dt(value: str) -> str:
     return datetime.fromisoformat(value).isoformat()
-
-
-def _load_following_snapshot() -> list[dict[str, str]]:
-    if not DEFAULT_FOLLOWING_SNAPSHOT.exists():
-        return []
-    payload = json.loads(DEFAULT_FOLLOWING_SNAPSHOT.read_text(encoding="utf-8"))
-    users = payload.get("users")
-    if not isinstance(users, list):
-        return []
-    result: list[dict[str, str]] = []
-    for item in users:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "")
-        url = str(item.get("url") or "")
-        slug = str(item.get("slug") or "")
-        headline = str(item.get("headline") or "")
-        avatar = str(item.get("avatar") or "")
-        if not name or not url or not slug:
-            continue
-        result.append(
-            {
-                "slug": slug,
-                "name": name,
-                "profile_url": url,
-                "headline": headline,
-                "avatar_url": avatar,
-            }
-        )
-    return result
 
 
 def _zhihu_latest_publish_sort_key(item: dict[str, object]) -> tuple[int, float]:
@@ -440,10 +408,9 @@ def api_stats():
 
 @app.get("/api/zhihu/stats")
 def api_zhihu_stats():
-    snapshot = _load_following_snapshot()
     db = _db()
     try:
-        total_following = len(snapshot) if snapshot else db.execute("SELECT COUNT(*) FROM ZhihuAuthor WHERE is_following = 1").fetchone()[0]
+        total_following = db.execute("SELECT COUNT(*) FROM ZhihuAuthor WHERE is_following = 1").fetchone()[0]
         answer_authors = db.execute("SELECT COUNT(DISTINCT author_id) FROM ZhihuAnswer").fetchone()[0]
         article_authors = db.execute("SELECT COUNT(DISTINCT author_id) FROM ZhihuArticle").fetchone()[0]
         pin_authors = db.execute("SELECT COUNT(DISTINCT author_id) FROM ZhihuPin").fetchone()[0]
@@ -591,12 +558,6 @@ def api_zhihu_following_contents(slug: str = Query(...)):
     finally:
         db.close()
     if row is None:
-        snapshot = _load_following_snapshot()
-        for item in snapshot:
-            if item["slug"] == slug:
-                row = (item["profile_url"], item["name"])
-                break
-    if row is None:
         raise HTTPException(status_code=404, detail="zhihu following not found")
 
     return {
@@ -607,7 +568,6 @@ def api_zhihu_following_contents(slug: str = Query(...)):
 
 @app.get("/api/zhihu/following")
 def api_zhihu_following():
-    snapshot = _load_following_snapshot()
     today_latest_map = _db_zhihu_today_latest_map()
     db = _db()
     try:
@@ -634,16 +594,9 @@ def api_zhihu_following():
     finally:
         db.close()
 
-    if snapshot:
-        result = []
-        for user in snapshot:
-            item = by_slug.get(user["slug"], {})
-            merged = {**item, **user, "is_following": True}
-            merged["today_latest_publish_time"] = today_latest_map.get(user["slug"])
-            result.append(merged)
-        return sorted(result, key=_zhihu_latest_publish_sort_key)
+    active_by_slug = {slug: item for slug, item in by_slug.items() if item["is_following"]}
     result = []
-    for item in by_slug.values():
+    for item in active_by_slug.values():
         item = dict(item)
         item["today_latest_publish_time"] = today_latest_map.get(item["slug"])
         result.append(item)
@@ -666,12 +619,6 @@ def api_zhihu_following_refresh(slug: str = Query(...)):
     finally:
         db.close()
     if row is None:
-        snapshot = _load_following_snapshot()
-        for item in snapshot:
-            if item["slug"] == slug:
-                row = (item["profile_url"],)
-                break
-    if row is None:
         raise HTTPException(status_code=404, detail="zhihu following not found")
     profile_url = str(row[0])
     try:
@@ -691,8 +638,11 @@ def api_zhihu_following_refresh(slug: str = Query(...)):
 
 @app.post("/api/zhihu/refresh-following")
 def api_zhihu_refresh_following():
-    payload = write_sync_request("refresh-following")
-    return {"ok": True, "queued": True, **payload}
+    try:
+        result = refresh_following()
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+    return {"ok": True, **result}
 
 
 @app.post("/api/zhihu/check-new")
