@@ -12,6 +12,7 @@ from cloakbrowser import launch_persistent_context
 from dclassql import Client
 from x11_wechat import DEFAULT_XAUTHORITY, DEFAULT_X_DISPLAY
 from zhihu_following_collect import collect_all_following, is_login_page, wait_for_login
+from zhihu_profile_today_updates import collect_today_updates
 
 
 DEFAULT_PROFILE_DIR = Path(__file__).with_name("browser_profiles") / "zhihu"
@@ -23,8 +24,6 @@ DEFAULT_FOLLOWING_DEBUG_PATH = Path(__file__).with_name("dumps") / "zhihu_follow
 DEFAULT_LIMIT = 20
 DEFAULT_CONTENT_LIMIT = 1
 DEFAULT_REQUEST_PROFILE_URL = "https://www.zhihu.com/people/bu-ye-cheng-76"
-DEFAULT_TODAY_OUTPUT_DIR = Path(__file__).with_name("dumps") / "zhihu_today"
-UV_BIN = Path("/home/lin/.local/bin/uv")
 INVALID_AUTHOR_SLUGS = {
     "following",
     "answers",
@@ -71,34 +70,16 @@ def profile_slug(profile_url: str) -> str:
     return parts[-1]
 
 
-def today_output_path(profile_url: str) -> Path:
-    DEFAULT_TODAY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return DEFAULT_TODAY_OUTPUT_DIR / f"{profile_slug(profile_url)}.json"
-
-
 def run_today_updates(profile_url: str, profile_dir: Path = DEFAULT_PROFILE_DIR) -> dict[str, object]:
-    output_path = today_output_path(profile_url)
-    cmd = [
-        str(UV_BIN),
-        "run",
-        "python",
-        str(Path(__file__).with_name("zhihu_profile_today_updates.py")),
-        "--url",
-        profile_url,
-        "--headless",
-        "--profile-dir",
-        str(profile_dir),
-        "--output",
-        str(output_path),
-    ]
-    result = subprocess.run(cmd, cwd=Path(__file__).parent, capture_output=True, text=True, timeout=180)
-    if result.returncode != 0:
-        raise RuntimeError(f"今日更新脚本失败: stdout={result.stdout} stderr={result.stderr}")
-    import_stats = import_today_output_file(profile_url, output_path)
+    payload = collect_today_updates(
+        profile_url=profile_url,
+        profile_dir=profile_dir,
+        headless=True,
+    )
+    import_stats = import_today_payload(profile_url, payload)
     return {
-        "output_path": str(output_path),
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "fetched_at": payload.get("fetched_at"),
+        "total_count": payload.get("total_count"),
         **import_stats,
     }
 
@@ -655,11 +636,6 @@ def import_today_payload(profile_url: str, payload: dict[str, object]) -> dict[s
         return stats
     finally:
         Client.close_all()
-
-
-def import_today_output_file(profile_url: str, output_path: Path) -> dict[str, int]:
-    payload = json.loads(output_path.read_text(encoding="utf-8"))
-    return import_today_payload(profile_url, payload)
 
 
 def upsert_answer(client: Client, author, item: dict[str, object], detail: dict[str, object] | None = None) -> bool:

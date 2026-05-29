@@ -592,6 +592,103 @@ def slim_item(item: dict[str, object]) -> dict[str, object]:
     }
 
 
+def collect_today_updates(
+    profile_url: str,
+    signin_url: str = DEFAULT_SIGNIN_URL,
+    profile_dir: Path = DEFAULT_PROFILE_DIR,
+    limit: int = DEFAULT_LIMIT,
+    dom_limit: int = 20,
+    login_wait: int = 300,
+    headless: bool = False,
+) -> dict[str, object]:
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    slug = profile_slug(profile_url)
+    start_dt = start_of_today_local()
+
+    context = launch_persistent_context(
+        profile_dir,
+        headless=headless,
+        locale="zh-CN",
+        timezone="Asia/Shanghai",
+        humanize=True,
+        viewport={"width": 1280, "height": 900},
+    )
+    try:
+        page = context.new_page()
+        wait_for_login(page, signin_url, login_wait)
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
+        if is_login_page(page):
+            raise RuntimeError("登录后仍然被重定向到登录页，请确认账号已完成登录")
+        page.wait_for_timeout(3_000)
+
+        api_urls: dict[str, str] = {}
+        errors: dict[str, str] = {}
+
+        answers: list[dict[str, object]] = []
+        try:
+            result = fetch_answers_payload(page, slug, limit)
+            api_urls["answers"] = str(result.get("url") or "")
+            answers = extract_today_answers(result.get("payload"), start_dt)
+            if answers:
+                answers = enrich_today_answers(page, answers)
+        except Exception as error:
+            errors["answers"] = str(error)
+
+        articles: list[dict[str, object]] = []
+        try:
+            result = fetch_articles_payload(page, slug, limit)
+            api_urls["articles"] = str(result.get("url") or "")
+            articles = extract_today_articles(result.get("payload"), start_dt)
+        except Exception as error:
+            errors["articles_direct"] = str(error)
+            try:
+                result = capture_api_payload_on_page(page, profile_url.rstrip("/") + "/posts", f"/api/v4/members/{slug}/articles")
+                api_urls["articles"] = str(result.get("url") or "")
+                articles = extract_today_articles(result.get("payload"), start_dt)
+            except Exception as page_error:
+                errors["articles"] = str(page_error)
+
+        pins: list[dict[str, object]] = []
+        try:
+            result = fetch_pins_payload(page, slug, limit)
+            api_urls["pins"] = str(result.get("url") or "")
+            pins = extract_today_pins(result.get("payload"), start_dt)
+        except Exception as error:
+            errors["pins_direct"] = str(error)
+            try:
+                result = capture_api_payload_on_page(page, profile_url.rstrip("/") + "/pins", "/api/v4/v2/pins/")
+                api_urls["pins"] = str(result.get("url") or "")
+                pins = extract_today_pins(result.get("payload"), start_dt)
+            except Exception as page_error:
+                errors["pins"] = str(page_error)
+
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
+        page.wait_for_timeout(3_000)
+        dom_today_items = extract_today_dom_fallback(page, start_dt, dom_limit)
+        api_items = merge_items(answers, articles, pins)
+        api_ids = ids_by_type(api_items)
+
+        dom_only_items = [
+            item
+            for item in dom_today_items
+            if str(item.get("content_id") or "") not in api_ids.get(str(item.get("content_type") or ""), [])
+        ]
+
+        final_items = merge_items(api_items, dom_only_items)
+
+        return {
+            "source_profile_url": profile_url,
+            "slug": slug,
+            "fetched_at": datetime.now().astimezone().isoformat(),
+            "today_start_iso": start_dt.isoformat(),
+            "errors": errors,
+            "total_count": len(final_items),
+            "items": [slim_item(item) for item in final_items],
+        }
+    finally:
+        context.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="抓取知乎主页今日更新（回答/文章/想法，多接口混合，DOM 兜底）")
     parser.add_argument("--url", default=DEFAULT_PROFILE_URL)
@@ -604,95 +701,18 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
 
-    args.profile_dir.mkdir(parents=True, exist_ok=True)
-    slug = profile_slug(args.url)
-    start_dt = start_of_today_local()
-
-    context = launch_persistent_context(
-        args.profile_dir,
+    payload = collect_today_updates(
+        profile_url=args.url,
+        signin_url=args.signin_url,
+        profile_dir=args.profile_dir,
+        limit=args.limit,
+        dom_limit=args.dom_limit,
+        login_wait=args.login_wait,
         headless=args.headless,
-        locale="zh-CN",
-        timezone="Asia/Shanghai",
-        humanize=True,
-        viewport={"width": 1280, "height": 900},
     )
-    try:
-        page = context.new_page()
-        wait_for_login(page, args.signin_url, args.login_wait)
-        page.goto(args.url, wait_until="domcontentloaded", timeout=60_000)
-        if is_login_page(page):
-            raise RuntimeError("登录后仍然被重定向到登录页，请确认账号已完成登录")
-        page.wait_for_timeout(3_000)
-
-        api_urls: dict[str, str] = {}
-        errors: dict[str, str] = {}
-
-        answers: list[dict[str, object]] = []
-        try:
-            result = fetch_answers_payload(page, slug, args.limit)
-            api_urls["answers"] = str(result.get("url") or "")
-            answers = extract_today_answers(result.get("payload"), start_dt)
-            if answers:
-                answers = enrich_today_answers(page, answers)
-        except Exception as error:
-            errors["answers"] = str(error)
-
-        articles: list[dict[str, object]] = []
-        try:
-            result = fetch_articles_payload(page, slug, args.limit)
-            api_urls["articles"] = str(result.get("url") or "")
-            articles = extract_today_articles(result.get("payload"), start_dt)
-        except Exception as error:
-            errors["articles_direct"] = str(error)
-            try:
-                result = capture_api_payload_on_page(page, args.url.rstrip("/") + "/posts", f"/api/v4/members/{slug}/articles")
-                api_urls["articles"] = str(result.get("url") or "")
-                articles = extract_today_articles(result.get("payload"), start_dt)
-            except Exception as page_error:
-                errors["articles"] = str(page_error)
-
-        pins: list[dict[str, object]] = []
-        try:
-            result = fetch_pins_payload(page, slug, args.limit)
-            api_urls["pins"] = str(result.get("url") or "")
-            pins = extract_today_pins(result.get("payload"), start_dt)
-        except Exception as error:
-            errors["pins_direct"] = str(error)
-            try:
-                result = capture_api_payload_on_page(page, args.url.rstrip("/") + "/pins", "/api/v4/v2/pins/")
-                api_urls["pins"] = str(result.get("url") or "")
-                pins = extract_today_pins(result.get("payload"), start_dt)
-            except Exception as page_error:
-                errors["pins"] = str(page_error)
-
-        page.goto(args.url, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(3_000)
-        dom_today_items = extract_today_dom_fallback(page, start_dt, args.dom_limit)
-        api_items = merge_items(answers, articles, pins)
-        api_ids = ids_by_type(api_items)
-
-        dom_only_items = [
-            item
-            for item in dom_today_items
-            if str(item.get("content_id") or "") not in api_ids.get(str(item.get("content_type") or ""), [])
-        ]
-
-        final_items = merge_items(api_items, dom_only_items)
-
-        payload = {
-            "source_profile_url": args.url,
-            "slug": slug,
-            "fetched_at": datetime.now().astimezone().isoformat(),
-            "today_start_iso": start_dt.isoformat(),
-            "errors": errors,
-            "total_count": len(final_items),
-            "items": [slim_item(item) for item in final_items],
-        }
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"已保存 {len(final_items)} 条今日更新到 {args.output}", flush=True)
-    finally:
-        context.close()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"已保存 {int(payload.get('total_count') or 0)} 条今日更新到 {args.output}", flush=True)
 
 
 if __name__ == "__main__":
