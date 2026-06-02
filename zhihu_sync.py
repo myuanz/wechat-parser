@@ -18,7 +18,7 @@ from dclassql import Client
 from db_model import DB_PATH
 from x11_wechat import DEFAULT_XAUTHORITY, DEFAULT_X_DISPLAY
 from zhihu_following_collect import collect_all_following, is_login_page, wait_for_login
-from zhihu_profile_today_updates import collect_today_updates
+from zhihu_profile_today_updates import collect_incremental_updates
 
 
 DEFAULT_PROFILE_DIR = Path(__file__).with_name("browser_profiles") / "zhihu"
@@ -115,10 +115,17 @@ def zhihu_browser_lock():
                 _zh_browser_lock_file = None
 
 
-def run_today_updates(profile_url: str, profile_dir: Path = DEFAULT_PROFILE_DIR) -> dict[str, object]:
+def run_incremental_updates(profile_url: str, profile_dir: Path = DEFAULT_PROFILE_DIR) -> dict[str, object]:
     with zhihu_browser_lock():
-        payload = collect_today_updates(
+        client = Client()
+        try:
+            author = client.zhihu_author.find_first(where={"slug": profile_slug(profile_url)})
+            last_seen_pub_time = None if author is None else author.last_seen_pub_time
+        finally:
+            Client.close_all()
+        payload = collect_incremental_updates(
             profile_url=profile_url,
+            last_seen_pub_time=last_seen_pub_time,
             profile_dir=profile_dir,
             headless=True,
         )
@@ -128,6 +135,9 @@ def run_today_updates(profile_url: str, profile_dir: Path = DEFAULT_PROFILE_DIR)
             "total_count": payload.get("total_count"),
             **import_stats,
         }
+
+
+run_today_updates = run_incremental_updates
 
 
 def content_id_from_item(item: dict[str, object]) -> str:
@@ -628,7 +638,7 @@ def import_today_payload(profile_url: str, payload: dict[str, object]) -> dict[s
     slug = profile_slug(profile_url)
     items = payload.get("items")
     if not isinstance(items, list):
-        raise RuntimeError("今日更新输出格式不对: items 缺失")
+        raise RuntimeError("增量更新输出格式不对: items 缺失")
     client = Client()
     now_value = now()
     try:
@@ -1023,7 +1033,7 @@ def sync_zhihu(profile_url: str = DEFAULT_PROFILE_URL, profile_dir: Path = DEFAU
             start = time.monotonic()
             print(f"知乎检查进度 {idx}/{total}: {author.name} {author.profile_url}", flush=True)
             try:
-                result = run_today_updates(author.profile_url, profile_dir=profile_dir)
+                result = run_incremental_updates(author.profile_url, profile_dir=profile_dir)
             except Exception as error:
                 traceback.print_exc()
                 failed_authors = stats["failed_authors"]
@@ -1126,7 +1136,7 @@ def sync_single_author(
         author = client.zhihu_author.find_first(where={"id": author.id})
         if author is None:
             raise RuntimeError(f"知乎作者不存在: {author_slug}")
-        result = run_today_updates(profile_url, profile_dir=profile_dir)
+        result = run_incremental_updates(profile_url, profile_dir=profile_dir)
         return {
             "new_answers": int(result.get("new_answers", 0)),
             "new_articles": int(result.get("new_articles", 0)),

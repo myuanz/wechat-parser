@@ -13,6 +13,7 @@ DEFAULT_SIGNIN_URL = "https://www.zhihu.com/signin"
 DEFAULT_PROFILE_DIR = Path(__file__).with_name("browser_profiles") / "zhihu"
 DEFAULT_OUTPUT = Path("/srv/samba/share") / "zhihu_profile_today_updates.json"
 DEFAULT_LIMIT = 30
+DEFAULT_INITIAL_RECENT_LIMIT = 10
 FETCH_TIMEOUT_MS = 30_000
 
 
@@ -112,10 +113,10 @@ def is_today_timestamp(timestamp: object, start_dt: datetime) -> bool:
     return datetime.fromtimestamp(timestamp).astimezone() >= start_dt
 
 
-def fetch_answers_payload(page, slug: str, limit: int) -> dict[str, object]:
+def fetch_answers_payload(page, slug: str, limit: int, offset: int = 0) -> dict[str, object]:
     payload = page.evaluate(
         """
-        async ({ slug, limit, timeoutMs }) => {
+        async ({ slug, limit, offset, timeoutMs }) => {
           const include = [
             "data[*].is_normal",
             "admin_closed_comment",
@@ -155,7 +156,7 @@ def fetch_answers_payload(page, slug: str, limit: int) -> dict[str, object]:
             "data[*].question.has_publishing_draft",
             "relationship"
           ].join(",");
-          const url = `https://www.zhihu.com/api/v4/members/${slug}/answers?include=${include}&offset=0&limit=${limit}&sort_by=created&ws_qiangzhisafe=0`;
+          const url = `https://www.zhihu.com/api/v4/members/${slug}/answers?include=${include}&offset=${offset}&limit=${limit}&sort_by=created&ws_qiangzhisafe=0`;
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), timeoutMs);
           try {
@@ -171,7 +172,7 @@ def fetch_answers_payload(page, slug: str, limit: int) -> dict[str, object]:
           }
         }
         """,
-        {"slug": slug, "limit": limit, "timeoutMs": FETCH_TIMEOUT_MS},
+        {"slug": slug, "limit": limit, "offset": offset, "timeoutMs": FETCH_TIMEOUT_MS},
     )
     if not isinstance(payload, dict):
         raise RuntimeError("回答接口返回格式不对")
@@ -216,10 +217,10 @@ def fetch_answer_detail(page, answer_id: str) -> dict[str, object]:
     return payload
 
 
-def fetch_articles_payload(page, slug: str, limit: int) -> dict[str, object]:
+def fetch_articles_payload(page, slug: str, limit: int, offset: int = 0) -> dict[str, object]:
     payload = page.evaluate(
         """
-        async ({ slug, limit, timeoutMs }) => {
+        async ({ slug, limit, offset, timeoutMs }) => {
           const include = [
             "data[*].comment_count",
             "suggest_edit",
@@ -245,7 +246,7 @@ def fetch_articles_payload(page, slug: str, limit: int) -> dict[str, object]:
             "data[*].author.kvip_info",
             "data[*].author.vip_info"
           ].join(",");
-          const url = `https://www.zhihu.com/api/v4/members/${slug}/articles?include=${include}&offset=0&limit=${limit}&sort_by=created&ws_qiangzhisafe=0`;
+          const url = `https://www.zhihu.com/api/v4/members/${slug}/articles?include=${include}&offset=${offset}&limit=${limit}&sort_by=created&ws_qiangzhisafe=0`;
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), timeoutMs);
           try {
@@ -261,18 +262,18 @@ def fetch_articles_payload(page, slug: str, limit: int) -> dict[str, object]:
           }
         }
         """,
-        {"slug": slug, "limit": limit, "timeoutMs": FETCH_TIMEOUT_MS},
+        {"slug": slug, "limit": limit, "offset": offset, "timeoutMs": FETCH_TIMEOUT_MS},
     )
     if not isinstance(payload, dict):
         raise RuntimeError("文章接口返回格式不对")
     return payload
 
 
-def fetch_pins_payload(page, slug: str, limit: int) -> dict[str, object]:
+def fetch_pins_payload(page, slug: str, limit: int, offset: int = 0) -> dict[str, object]:
     payload = page.evaluate(
         """
-        async ({ slug, limit, timeoutMs }) => {
-          const url = `https://www.zhihu.com/api/v4/v2/members/${slug}/pins?offset=0&limit=${limit}`;
+        async ({ slug, limit, offset, timeoutMs }) => {
+          const url = `https://www.zhihu.com/api/v4/v2/members/${slug}/pins?offset=${offset}&limit=${limit}`;
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), timeoutMs);
           try {
@@ -288,7 +289,7 @@ def fetch_pins_payload(page, slug: str, limit: int) -> dict[str, object]:
           }
         }
         """,
-        {"slug": slug, "limit": limit, "timeoutMs": FETCH_TIMEOUT_MS},
+        {"slug": slug, "limit": limit, "offset": offset, "timeoutMs": FETCH_TIMEOUT_MS},
     )
     if not isinstance(payload, dict):
         raise RuntimeError("想法接口返回格式不对")
@@ -631,18 +632,181 @@ def slim_item(item: dict[str, object]) -> dict[str, object]:
     }
 
 
-def collect_today_updates(
+def payload_data_items(payload: object) -> list[dict[str, object]]:
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+def payload_is_end(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return True
+    paging = payload.get("paging")
+    if not isinstance(paging, dict):
+        return False
+    return bool(paging.get("is_end"))
+
+
+def cutoff_timestamp(last_seen_pub_time: datetime | None) -> int | None:
+    if last_seen_pub_time is None:
+        return None
+    return int(last_seen_pub_time.timestamp())
+
+
+def extract_incremental_answers(payload: object, stop_before_ts: int | None, remaining: int | None) -> tuple[list[dict[str, object]], bool]:
+    items: list[dict[str, object]] = []
+    should_stop = False
+    for item in payload_data_items(payload):
+        created_time = item.get("created_time")
+        if not isinstance(created_time, int | float):
+            continue
+        if stop_before_ts is not None and created_time <= stop_before_ts:
+            should_stop = True
+            break
+        question = item.get("question") if isinstance(item.get("question"), dict) else {}
+        author = item.get("author") if isinstance(item.get("author"), dict) else {}
+        answer_id = item.get("id")
+        question_id = question.get("id")
+        content_html = item.get("content") if isinstance(item.get("content"), str) else ""
+        excerpt = item.get("excerpt") or item.get("excerpt_new") or content_html or ""
+        items.append(
+            {
+                "content_type": "answer",
+                "content_id": str(answer_id or ""),
+                "publish_time": created_time,
+                "publish_time_iso": to_iso(created_time),
+                "updated_time": item.get("updated_time"),
+                "updated_time_iso": to_iso(item.get("updated_time")),
+                "url": build_answer_url(question_id, answer_id),
+                "title": str(question.get("title") or ""),
+                "content_html": content_html,
+                "content_text": html_to_text(content_html) if content_html else str(excerpt),
+                "author_name": str(author.get("name") or ""),
+                "voteup_count": item.get("voteup_count"),
+                "comment_count": item.get("comment_count"),
+                "source_mode": "api",
+                "source_list": "answers",
+            }
+        )
+        if remaining is not None and len(items) >= remaining:
+            should_stop = True
+            break
+    return items, should_stop
+
+
+def extract_incremental_articles(payload: object, stop_before_ts: int | None, remaining: int | None) -> tuple[list[dict[str, object]], bool]:
+    items: list[dict[str, object]] = []
+    should_stop = False
+    for item in payload_data_items(payload):
+        created = item.get("created")
+        if not isinstance(created, int | float):
+            continue
+        if stop_before_ts is not None and created <= stop_before_ts:
+            should_stop = True
+            break
+        author = item.get("author") if isinstance(item.get("author"), dict) else {}
+        article_id = item.get("id")
+        content_html = item.get("content") if isinstance(item.get("content"), str) else ""
+        excerpt = item.get("excerpt") if isinstance(item.get("excerpt"), str) else ""
+        items.append(
+            {
+                "content_type": "article",
+                "content_id": str(article_id or ""),
+                "publish_time": created,
+                "publish_time_iso": to_iso(created),
+                "updated_time": item.get("updated"),
+                "updated_time_iso": to_iso(item.get("updated")),
+                "url": build_article_url(article_id),
+                "title": str(item.get("title") or ""),
+                "content_html": content_html,
+                "content_text": html_to_text(content_html) if content_html else excerpt,
+                "author_name": str(author.get("name") or ""),
+                "voteup_count": item.get("voteup_count"),
+                "comment_count": item.get("comment_count"),
+                "source_mode": "api",
+                "source_list": "articles",
+            }
+        )
+        if remaining is not None and len(items) >= remaining:
+            should_stop = True
+            break
+    return items, should_stop
+
+
+def extract_incremental_pins(payload: object, stop_before_ts: int | None, remaining: int | None) -> tuple[list[dict[str, object]], bool]:
+    items: list[dict[str, object]] = []
+    should_stop = False
+    for item in payload_data_items(payload):
+        created = item.get("created")
+        if not isinstance(created, int | float):
+            continue
+        if stop_before_ts is not None and created <= stop_before_ts:
+            should_stop = True
+            break
+        author = item.get("author") if isinstance(item.get("author"), dict) else {}
+        pin_id = item.get("id")
+        title, content_html = extract_pin_title_and_html(item)
+        if not content_html and isinstance(item.get("content_html"), str):
+            content_html = str(item.get("content_html") or "")
+        items.append(
+            {
+                "content_type": "pin",
+                "content_id": str(pin_id or ""),
+                "publish_time": created,
+                "publish_time_iso": to_iso(created),
+                "updated_time": item.get("updated"),
+                "updated_time_iso": to_iso(item.get("updated")),
+                "url": build_pin_url(pin_id),
+                "title": title,
+                "content_html": content_html,
+                "content_text": html_to_text(content_html),
+                "author_name": str(author.get("name") or ""),
+                "voteup_count": item.get("voteup_count"),
+                "comment_count": item.get("comment_count"),
+                "source_mode": "api",
+                "source_list": "pins",
+            }
+        )
+        if remaining is not None and len(items) >= remaining:
+            should_stop = True
+            break
+    return items, should_stop
+
+
+def collect_paginated_items(page, slug: str, page_limit: int, stop_before_ts: int | None, initial_recent_limit: int, fetch_payload, extract_items) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    offset = 0
+    remaining = initial_recent_limit if stop_before_ts is None else None
+    while True:
+        result = fetch_payload(page, slug, page_limit, offset)
+        payload = result.get("payload")
+        page_data = payload_data_items(payload)
+        page_items, should_stop = extract_items(payload, stop_before_ts, remaining)
+        items.extend(page_items)
+        if remaining is not None:
+            remaining -= len(page_items)
+            if remaining <= 0:
+                break
+        if should_stop or not page_data or len(page_data) < page_limit or payload_is_end(payload):
+            break
+        offset += len(page_data)
+    return items
+
+
+def collect_incremental_updates(
     profile_url: str,
+    last_seen_pub_time: datetime | None = None,
     signin_url: str = DEFAULT_SIGNIN_URL,
     profile_dir: Path = DEFAULT_PROFILE_DIR,
     limit: int = DEFAULT_LIMIT,
-    dom_limit: int = 20,
+    initial_recent_limit: int = DEFAULT_INITIAL_RECENT_LIMIT,
     login_wait: int = 300,
     headless: bool = False,
 ) -> dict[str, object]:
     profile_dir.mkdir(parents=True, exist_ok=True)
     slug = profile_slug(profile_url)
-    start_dt = start_of_today_local()
+    stop_before_ts = cutoff_timestamp(last_seen_pub_time)
 
     context = launch_persistent_context(
         profile_dir,
@@ -662,9 +826,17 @@ def collect_today_updates(
 
         answers: list[dict[str, object]] = []
         try:
-            result = fetch_answers_payload(page, slug, limit)
+            result = fetch_answers_payload(page, slug, limit, 0)
             api_urls["answers"] = str(result.get("url") or "")
-            answers = extract_today_answers(result.get("payload"), start_dt)
+            answers = collect_paginated_items(
+                page,
+                slug,
+                limit,
+                stop_before_ts,
+                initial_recent_limit,
+                fetch_answers_payload,
+                extract_incremental_answers,
+            )
             if answers:
                 answers = enrich_today_answers(page, answers)
         except Exception as error:
@@ -672,83 +844,76 @@ def collect_today_updates(
 
         articles: list[dict[str, object]] = []
         try:
-            result = fetch_articles_payload(page, slug, limit)
+            result = fetch_articles_payload(page, slug, limit, 0)
             api_urls["articles"] = str(result.get("url") or "")
-            articles = extract_today_articles(result.get("payload"), start_dt)
+            articles = collect_paginated_items(
+                page,
+                slug,
+                limit,
+                stop_before_ts,
+                initial_recent_limit,
+                fetch_articles_payload,
+                extract_incremental_articles,
+            )
         except Exception as error:
-            errors["articles_direct"] = str(error)
-            try:
-                result = capture_api_payload_on_page(page, profile_url.rstrip("/") + "/posts", f"/api/v4/members/{slug}/articles")
-                api_urls["articles"] = str(result.get("url") or "")
-                articles = extract_today_articles(result.get("payload"), start_dt)
-            except Exception as page_error:
-                errors["articles"] = str(page_error)
+            errors["articles"] = str(error)
 
         pins: list[dict[str, object]] = []
         try:
-            result = fetch_pins_payload(page, slug, limit)
+            result = fetch_pins_payload(page, slug, limit, 0)
             api_urls["pins"] = str(result.get("url") or "")
-            pins = extract_today_pins(result.get("payload"), start_dt)
+            pins = collect_paginated_items(
+                page,
+                slug,
+                limit,
+                stop_before_ts,
+                initial_recent_limit,
+                fetch_pins_payload,
+                extract_incremental_pins,
+            )
         except Exception as error:
-            errors["pins_direct"] = str(error)
-            try:
-                result = capture_api_payload_on_page(page, profile_url.rstrip("/") + "/pins", "/api/v4/v2/pins/")
-                api_urls["pins"] = str(result.get("url") or "")
-                pins = extract_today_pins(result.get("payload"), start_dt)
-            except Exception as page_error:
-                errors["pins"] = str(page_error)
+            errors["pins"] = str(error)
 
-        page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(3_000)
-        dom_today_items = extract_today_dom_fallback(page, start_dt, dom_limit)
         api_items = merge_items(answers, articles, pins)
-        api_ids = ids_by_type(api_items)
-
-        dom_only_items = [
-            item
-            for item in dom_today_items
-            if str(item.get("content_id") or "") not in api_ids.get(str(item.get("content_type") or ""), [])
-        ]
-
-        final_items = merge_items(api_items, dom_only_items)
 
         return {
             "source_profile_url": profile_url,
             "slug": slug,
             "fetched_at": datetime.now().astimezone().isoformat(),
-            "today_start_iso": start_dt.isoformat(),
+            "last_seen_pub_time_iso": last_seen_pub_time.isoformat() if last_seen_pub_time is not None else None,
+            "initial_recent_limit": initial_recent_limit,
             "errors": errors,
-            "total_count": len(final_items),
-            "items": [slim_item(item) for item in final_items],
+            "total_count": len(api_items),
+            "items": [slim_item(item) for item in api_items],
         }
     finally:
         context.close()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="抓取知乎主页今日更新（回答/文章/想法，多接口混合，DOM 兜底）")
+    parser = argparse.ArgumentParser(description="抓取知乎主页增量更新（回答/文章/想法）")
     parser.add_argument("--url", default=DEFAULT_PROFILE_URL)
     parser.add_argument("--signin-url", default=DEFAULT_SIGNIN_URL)
     parser.add_argument("--profile-dir", type=Path, default=DEFAULT_PROFILE_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    parser.add_argument("--dom-limit", type=int, default=20)
+    parser.add_argument("--initial-recent-limit", type=int, default=DEFAULT_INITIAL_RECENT_LIMIT)
     parser.add_argument("--login-wait", type=int, default=300)
     parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
 
-    payload = collect_today_updates(
+    payload = collect_incremental_updates(
         profile_url=args.url,
         signin_url=args.signin_url,
         profile_dir=args.profile_dir,
         limit=args.limit,
-        dom_limit=args.dom_limit,
+        initial_recent_limit=args.initial_recent_limit,
         login_wait=args.login_wait,
         headless=args.headless,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"已保存 {int(payload.get('total_count') or 0)} 条今日更新到 {args.output}", flush=True)
+    print(f"已保存 {int(payload.get('total_count') or 0)} 条增量更新到 {args.output}", flush=True)
 
 
 if __name__ == "__main__":

@@ -231,11 +231,11 @@ function switchView(view) {
     <span class="summary-actions"><button id="zhihu-check-new-btn" type="button" onclick="checkZhihuNew()">检查新内容</button></span><span id="zhihu-check-new-status" class="summary-status"></span><br>
     <span style="font-size:10px">上次检查 <span id="zh-last-check">-</span></span>`;
   $('#account-list').innerHTML = '<div class="loading">知乎关注列表稍后接入</div>';
-  $('#center-title').textContent = '知乎今日更新';
+  $('#center-title').textContent = '知乎增量内容';
   $('#article-list').innerHTML = '<div class="loading">请选择左侧知乎账号</div>';
   $('#pager').innerHTML = '';
   $('#article-url-bar').style.display = 'none';
-  $('#article-view').innerHTML = '<div class="article-empty">请选择左侧知乎账号<br><small>点击后可直接查看今日更新</small></div>';
+  $('#article-view').innerHTML = '<div class="article-empty">请选择左侧知乎账号<br><small>点击后可直接查看最新已收录内容</small></div>';
   loadZhihuStats();
 }
 
@@ -281,12 +281,12 @@ async function loadZhihuToday() {
         <div class="art-meta"><span>${h(item.author_name || '')}</span><span>${h(item.content_type || '')}</span></div>
       </div>
     `).join('')
-    : '<div class="loading">今天还没有新增</div>';
+    : '<div class="loading">还没有已收录内容</div>';
   if (zhihuTodayItems.length && zhihuSelectedItemIdx !== null) selectZhihuItem(zhihuSelectedItemIdx);
   else if (zhihuTodayItems.length) selectZhihuItem(0);
   else {
     $('#article-url-bar').style.display = 'none';
-    $('#article-view').innerHTML = '<div class="article-empty">今天还没有新增</div>';
+    $('#article-view').innerHTML = '<div class="article-empty">还没有已收录内容</div>';
   }
 }
 
@@ -313,7 +313,7 @@ function setZhihuCenterTitle(name, statusText = '') {
   const titleHtml = profileUrl
     ? `<a href="${hAttr(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color:#1a6feb;text-decoration:none">${h(name)}</a>`
     : h(name);
-  $('#center-title').innerHTML = `${titleHtml} <span class="summary-actions"><button id="zhihu-refresh-today-btn" type="button" onclick="refreshZhihuToday()">抓今日更新</button></span><span id="zhihu-refresh-status" class="summary-status">${h(statusText)}</span>`;
+  $('#center-title').innerHTML = `${titleHtml} <span class="summary-actions"><button id="zhihu-refresh-today-btn" type="button" onclick="refreshZhihuToday()">增量抓取</button></span><span id="zhihu-refresh-status" class="summary-status">${h(statusText)}</span>`;
 }
 
 function setZhihuRefreshStatus(statusText = '') {
