@@ -4,8 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/projects/wechat-parser
-ExecStart=/root/.local/bin/uv run python wechat_article_auto_collect.py --interval 60
+User=lin
+Group=lin
+WorkingDirectory=/home/lin/projects/wechat-parser
+ExecStart=/home/lin/.local/bin/uv run python wechat_article_auto_collect.py --interval 900 --wait-after-click 5
 Restart=always
 RestartSec=10
 

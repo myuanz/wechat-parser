@@ -1,15 +1,13 @@
 [Unit]
-Description=wechat-parser collector server
+Description=wechat-parser zhihu worker
 After=network.target
 
 [Service]
-Type=simple
+Type=oneshot
 User=lin
 Group=lin
 WorkingDirectory=/home/lin/projects/wechat-parser
-ExecStart=/home/lin/.local/bin/uv run python server.py
-Restart=always
-RestartSec=5
+ExecStart=/home/lin/.local/bin/uv run python zhihu_worker.py
 
 [Install]
 WantedBy=multi-user.target

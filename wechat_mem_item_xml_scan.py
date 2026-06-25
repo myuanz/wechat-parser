@@ -203,7 +203,18 @@ def scan_pid(pid: int, all_regions: bool) -> list[ItemXml]:
     rows: list[ItemXml] = []
     chunk_size = 8 * 1024 * 1024
     overlap = chunk_size
-    with open(f"/proc/{pid}/mem", "rb", buffering=0) as mem:
+    try:
+        mem = open(f"/proc/{pid}/mem", "rb", buffering=0)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"无法读取 /proc/{pid}/mem。当前系统的 ptrace_scope 很可能限制了同用户进程内存读取。\n"
+            f"常见处理方式：\n"
+            f"1. 临时放开限制：sudo sysctl kernel.yama.ptrace_scope=0\n"
+            f"2. 或者把微信作为当前采集进程的子进程启动后再扫\n"
+            f"3. 或者以有 CAP_SYS_PTRACE 的方式运行扫描器\n"
+            f"pid={pid} role={role}"
+        ) from exc
+    with mem:
         for region in read_maps(pid):
             if not region_wanted(region, all_regions):
                 continue
