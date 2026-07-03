@@ -17,6 +17,10 @@ from fetch_wechat_article import DEFAULT_FETCH_DELAY, ArticleFetcher
 from wechat_mem_item_xml_scan import ItemXml, dedupe
 from wechat_mem_item_xml_scan import scan_pid as scan_pid_matcher
 from wechat_mem_xml_parse_scan import scan_pid as scan_pid_parser
+from window_alert import DEFAULT_WINDOW_ALERT_COOLDOWN_SECONDS
+from window_alert import DEFAULT_WINDOW_ALERT_THRESHOLD
+from window_alert import configure as configure_window_alert
+from window_alert import window_alert
 from x11_wechat import capture_wechat_png, click_wechat, move_wechat_mouse
 
 
@@ -206,6 +210,7 @@ def save_click(
 
 def capture_unread_points() -> list[tuple[int, int]]:
     image = capture_wechat_png()
+    window_alert.on_window_found()
     ui = WechatUi(image)
     ui.find_split_line()
     points = ui.find_unread_subs()
@@ -295,8 +300,16 @@ def main() -> None:
     parser.add_argument("--fetch-delay", type=float, default=DEFAULT_FETCH_DELAY, help="后台抓取文章内容时每次请求之间的间隔秒数")
     parser.add_argument("--all-regions", action="store_true", help="传给内存扫描，扫描更多内存区域")
     parser.add_argument("--scanner", choices=["parser", "matcher"], default="parser", help="内存扫描实现；parser=严格 XML 解析，matcher=旧文本匹配")
+    parser.add_argument("--window-alert-threshold", type=int, default=DEFAULT_WINDOW_ALERT_THRESHOLD, help="连续多少次找不到窗口后通知")
+    parser.add_argument("--window-alert-cooldown", type=int, default=DEFAULT_WINDOW_ALERT_COOLDOWN_SECONDS, help="窗口缺失通知冷却秒数")
+    parser.add_argument("--feishu-webhook-url", default=os.environ.get("FEISHU_WEBHOOK_URL", "https://open.feishu.cn/open-apis/bot/v2/hook/9e9772ef-3b83-4e0c-8338-ea77d0808550"), help="飞书机器人 webhook；默认读取 FEISHU_WEBHOOK_URL")
     parser.add_argument("--reexeced", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    configure_window_alert(
+        args.feishu_webhook_url,
+        args.window_alert_threshold,
+        args.window_alert_cooldown,
+    )
 
     client = Client()
     try:
@@ -314,6 +327,10 @@ def main() -> None:
                 fetcher=fetcher,
             )
         print("== 本轮结束 ==")
+    except RuntimeError as error:
+        if not window_alert.is_window_missing_error(error):
+            raise
+        window_alert.on_window_missing(error)
     finally:
         Client.close_all()
 
